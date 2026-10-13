@@ -1,0 +1,63 @@
+name: Build iOS (unsigned IPA)
+
+# 从 .github/workflows/build.yaml 抽出的 iOS 矩阵腿，行为等价。
+# 原 build.yaml 只有 push tags v* 触发、无手动入口，这里补上 workflow_dispatch。
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-ios:
+    runs-on: macos-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          # 与原文件 build job 一致：iOS 腿硬编码 3.44.0
+          flutter-version: '3.44.0'
+          cache: true
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core/doh_proxy
+          key: ios-
+
+      - name: Setup iOS Rust targets
+        run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+
+      # 让 CocoaPods 拉 pod 仓库时走 token，避免匿名限流
+      - name: Configure Git for CocoaPods
+        run: git config --global url."https://x-access-token:${{ github.token }}@github.com/".insteadOf "https://github.com/"
+
+      # dart tool/flutterw.dart 内部会先跑 project_prep + native:prepare ios
+      - name: Build iOS
+        run: |
+          dart tool/flutterw.dart build ios --release --no-codesign
+          nm -gU build/ios/iphoneos/Runner.app/Runner | grep "_doh_proxy_start_with_config_json"
+          mkdir -p dist
+          cd build/ios/iphoneos
+          mkdir Payload
+          cp -r Runner.app Payload/
+          zip -r fluxdo-unsigned.ipa Payload
+          mv fluxdo-unsigned.ipa ../../../dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifact-ios
+          path: ./dist
+          overwrite: true
