@@ -1,16 +1,64 @@
 name: Build iOS (unsigned IPA)
 
 # iOS-only leg. Pulls the author's cfluxdo branch directly; nothing is merged
-# into this repo. The original build.yaml only triggered on v* tags and had no
-# manual entry point, so workflow_dispatch is added here.
+# into this repo.
+#
+# Triggers:
+#   workflow_dispatch - run by hand from the Actions tab
+#   schedule          - daily check; the build is skipped entirely when
+#                       1molchuan/cfluxdo has no commit newer than the last
+#                       successful build
+#   push tags v*      - kept from the original build.yaml
 on:
   workflow_dispatch:
+  schedule:
+    # 20:00 UTC = 04:00 Asia/Shanghai
+    - cron: '0 20 * * *'
   push:
     tags:
       - 'v*'
 
 jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.upstream.outputs.sha }}
+      changed: ${{ steps.decide.outputs.changed }}
+    steps:
+      - name: Resolve upstream cfluxdo HEAD
+        id: upstream
+        run: |
+          sha=$(git ls-remote https://github.com/1molchuan/fluxdo refs/heads/cfluxdo | cut -f1)
+          if [ -z "$sha" ]; then
+            echo "could not read refs/heads/cfluxdo from 1molchuan/fluxdo" >&2
+            exit 1
+          fi
+          echo "upstream cfluxdo = $sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      # A successful build leaves a marker cache under key cfluxdo-built-<sha>.
+      # An exact hit means this exact revision was already built and shipped.
+      - name: Look for a previous build of this revision
+        id: check
+        uses: actions/cache/restore@v4
+        with:
+          path: .built-marker
+          key: cfluxdo-built-${{ steps.upstream.outputs.sha }}
+
+      - name: Decide whether to build
+        id: decide
+        run: |
+          if [ "${{ steps.check.outputs.cache-hit }}" = "true" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "already built ${{ steps.upstream.outputs.sha }} - skipping"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "new revision ${{ steps.upstream.outputs.sha }} - building"
+          fi
+
   build-ios:
+    needs: check-upstream
+    if: needs.check-upstream.outputs.changed == 'true'
     runs-on: macos-latest
     permissions:
       contents: read
@@ -79,3 +127,16 @@ jobs:
           name: artifact-ios
           path: ./dist
           overwrite: true
+
+      # Only recorded after everything above succeeded, so a failed build is
+      # retried on the next scheduled run.
+      - name: Mark this revision as built
+        run: |
+          mkdir -p .built-marker
+          echo "${{ needs.check-upstream.outputs.sha }}" > .built-marker/built.txt
+
+      - name: Save build marker
+        uses: actions/cache/save@v4
+        with:
+          path: .built-marker
+          key: cfluxdo-built-${{ needs.check-upstream.outputs.sha }}
