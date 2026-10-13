@@ -1,7 +1,8 @@
 name: Build iOS (unsigned IPA)
 
-# 从 .github/workflows/build.yaml 抽出的 iOS 矩阵腿，行为等价。
-# 原 build.yaml 只有 push tags v* 触发、无手动入口，这里补上 workflow_dispatch。
+# iOS-only leg. Pulls the author's cfluxdo branch directly; nothing is merged
+# into this repo. The original build.yaml only triggered on v* tags and had no
+# manual entry point, so workflow_dispatch is added here.
 on:
   workflow_dispatch:
   push:
@@ -15,15 +16,31 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - name: Checkout
+      # Key step: do NOT build this repo's pristine main; take 1molchuan's
+      # cfluxdo branch, which carries all 34 author changes.
+      - name: Checkout cfluxdo
         uses: actions/checkout@v4
         with:
+          repository: 1molchuan/fluxdo
+          ref: cfluxdo
           submodules: recursive
+
+      - name: Show checked-out commit
+        run: git log -1 --oneline
+
+      # The author only renamed Android; iOS Info.plist still says FluxDO.
+      # Align the iOS display name with cfluxdo at build time.
+      - name: Rename iOS app to cfluxdo
+        run: |
+          plutil -replace CFBundleDisplayName -string cfluxdo ios/Runner/Info.plist
+          plutil -replace CFBundleName -string cfluxdo ios/Runner/Info.plist
+          echo "--- after rename ---"
+          plutil -p ios/Runner/Info.plist | grep -E 'CFBundleDisplayName|CFBundleName'
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          # 与原文件 build job 一致：iOS 腿硬编码 3.44.0
+          # Same as the build job in the original file: iOS leg pins 3.44.0
           flutter-version: '3.44.0'
           cache: true
 
@@ -39,15 +56,16 @@ jobs:
       - name: Setup iOS Rust targets
         run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
 
-      # 让 CocoaPods 拉 pod 仓库时走 token，避免匿名限流
+      # Route CocoaPods git access through the token to avoid anonymous limits
       - name: Configure Git for CocoaPods
         run: git config --global url."https://x-access-token:${{ github.token }}@github.com/".insteadOf "https://github.com/"
 
-      # dart tool/flutterw.dart 内部会先跑 project_prep + native:prepare ios
+      # dart tool/flutterw.dart internally runs project_prep + native:prepare ios
       - name: Build iOS
         run: |
           dart tool/flutterw.dart build ios --release --no-codesign
           nm -gU build/ios/iphoneos/Runner.app/Runner | grep "_doh_proxy_start_with_config_json"
+          plutil -p build/ios/iphoneos/Runner.app/Info.plist | grep -E 'CFBundleDisplayName|CFBundleName|CFBundleIdentifier'
           mkdir -p dist
           cd build/ios/iphoneos
           mkdir Payload
