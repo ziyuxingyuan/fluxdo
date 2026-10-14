@@ -1,7 +1,12 @@
 name: Build iOS (unsigned IPA)
 
-# iOS-only leg. Pulls the author's cfluxdo branch directly; nothing is merged
-# into this repo.
+# iOS-only leg.
+#
+# Upstream 1molchuan/fluxdo went Android-only in 1.0 (commit 323608c4 removed
+# ios/, macos/, apple/ and the iOS-only dependencies). The iOS shell is
+# therefore restored inside this job from the last upstream revision that still
+# had it, and layered on top of the current 1.0 sources. Nothing is written back
+# to 1molchuan/fluxdo and nothing is merged into this repo.
 #
 # Triggers:
 #   workflow_dispatch - run by hand from the Actions tab
@@ -17,6 +22,11 @@ on:
   push:
     tags:
       - 'v*'
+
+env:
+  # Last upstream cfluxdo revision that still carried ios/ and apple/.
+  # 1molchuan/fluxdo commit 323608c4 ("仅保留 Android") deleted them.
+  IOS_SHELL_SHA: 11c1fd3c975af09025be6053411d92d41bb161f2
 
 jobs:
   check-upstream:
@@ -64,20 +74,53 @@ jobs:
       contents: read
       id-token: write
     steps:
-      # Key step: do NOT build this repo's pristine main; take 1molchuan's
-      # cfluxdo branch, which carries all 34 author changes.
-      - name: Checkout cfluxdo
+      # Do NOT build this repo's pristine main; take 1molchuan's cfluxdo branch,
+      # which carries all of the author's changes. Full history is fetched so
+      # the iOS shell can be pulled out of an older revision below.
+      - name: Checkout cfluxdo (1.0 sources)
         uses: actions/checkout@v4
         with:
           repository: 1molchuan/fluxdo
           ref: cfluxdo
           submodules: recursive
+          fetch-depth: 0
 
       - name: Show checked-out commit
         run: git log -1 --oneline
 
-      # The author only renamed Android; iOS Info.plist still says FluxDO.
-      # Align the iOS display name with cfluxdo at build time.
+      # 1.0 removed ios/ and apple/. Restore just those two paths from the last
+      # revision that had them. Working tree only - no upstream write.
+      - name: Restore iOS shell from the last iOS-bearing revision
+        run: |
+          git checkout "$IOS_SHELL_SHA" -- ios apple
+          echo "--- restored from $IOS_SHELL_SHA ---"
+          ls ios/Runner | head -n 25
+
+      # The restored shell imports workmanager_apple and registers a periodic
+      # background task, but 1.0 deliberately dropped that dependency. Strip
+      # both lines so the Swift target links without it. Consequence: no iOS
+      # background notification polling (the app only polls while foregrounded).
+      - name: Drop workmanager from the iOS shell
+        run: |
+          perl -ni -e 'print unless /^import workmanager_apple$/ or /WorkmanagerPlugin\.registerPeriodicTask/' ios/Runner/AppDelegate.swift
+          if grep -q -i workmanager ios/Runner/AppDelegate.swift; then
+            echo "workmanager references still present:" >&2
+            grep -n -i workmanager ios/Runner/AppDelegate.swift >&2
+            exit 1
+          fi
+          echo "workmanager references removed from AppDelegate.swift"
+
+      # 1.0's pubspec dropped the SwiftPM opt-out along with the desktop
+      # platforms. Flutter 3.44's generated Swift package pins the macOS
+      # deployment target too low and breaks plugins such as gal, so keep the
+      # CocoaPods path.
+      - name: Keep Flutter on CocoaPods instead of SwiftPM
+        run: |
+          perl -0pi -e 's/flutter:\n  uses-material-design: true/flutter:\n  config:\n    enable-swift-package-manager: false\n  uses-material-design: true/' pubspec.yaml
+          grep -n -A1 'enable-swift-package-manager' pubspec.yaml || echo "note: substitution did not apply"
+
+      # The author renamed Android and the in-app branding to cfluxdo; the iOS
+      # Info.plist still says FluxDO. Align the display name at build time.
       - name: Rename iOS app to cfluxdo
         run: |
           plutil -replace CFBundleDisplayName -string cfluxdo ios/Runner/Info.plist
@@ -118,8 +161,8 @@ jobs:
           cd build/ios/iphoneos
           mkdir Payload
           cp -r Runner.app Payload/
-          zip -r fluxdo-unsigned.ipa Payload
-          mv fluxdo-unsigned.ipa ../../../dist/
+          zip -r cfluxdo-unsigned.ipa Payload
+          mv cfluxdo-unsigned.ipa ../../../dist/
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
