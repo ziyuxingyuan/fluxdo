@@ -58,8 +58,16 @@ jobs:
             echo "no Mach-O linker available"; ls /usr/bin | grep -i lld || true; exit 1
           fi
           echo "ld64 = $LD64_BIN"
-          ln -sf "$(find_tool clang)"        "$TC/clang"
-          ln -sf "$(find_tool clang++)"      "$TC/clang++"
+          rm -f "$TC/clang" "$TC/clang++"
+          cat > "$TC/clang" <<EOF
+          #!/bin/sh
+          exec /usr/bin/clang -fuse-ld=$TC/ld64 "\$@"
+          EOF
+          cat > "$TC/clang++" <<EOF
+          #!/bin/sh
+          exec /usr/bin/clang++ -fuse-ld=$TC/ld64 "\$@"
+          EOF
+          chmod +x "$TC/clang" "$TC/clang++"
           ln -sf "$LD64_BIN"                 "$TC/ld64"
           ln -sf "$LD64_BIN"                 "$TC/ld"
           ln -sf "$(find_tool llvm-ar ar)"   "$TC/ar"
