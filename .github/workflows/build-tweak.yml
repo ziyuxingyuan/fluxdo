@@ -9,24 +9,39 @@ on:
 
 jobs:
   build:
-    runs-on: macos-13
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            make git curl xz-utils file libplist-utils dpkg-dev fakeroot \
+            clang lld llvm
+          LDID_URL=$(curl -fsSL https://api.github.com/repos/ProcursusTeam/ldid/releases/latest \
+            | grep -o 'https://[^"]*linux[^"]*x86_64[^"]*' | head -n1)
+          echo "ldid: $LDID_URL"
+          curl -fsSL -o /tmp/ldid "$LDID_URL"
+          chmod +x /tmp/ldid
+          sudo mv /tmp/ldid /usr/local/bin/ldid
+          ldid -v || true
+
       - name: Install Theos
         run: |
-          brew install ldid xz
           git clone --recursive --depth 1 https://github.com/theos/theos.git "$HOME/theos"
           git clone --depth 1 https://github.com/theos/sdks.git /tmp/sdks
           mkdir -p "$HOME/theos/sdks"
-          cp -R /tmp/sdks/*.sdk "$HOME/theos/sdks/"
+          cp -R /tmp/sdks/*.sdk "$HOME/theos/sdks/" || true
+          ls "$HOME/theos/sdks" | head -n 5
           echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+          echo "$HOME/theos/bin" >> "$GITHUB_PATH"
 
       - name: Build deb
         run: |
           make -C tweak clean package THEOS_PACKAGE_SCHEME=rootless FINALPACKAGE=1
 
-      - name: Show artifacts
+      - name: Show result
         run: ls -lh tweak/packages/ || true
 
       - uses: actions/upload-artifact@v4
