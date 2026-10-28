@@ -138,19 +138,19 @@ static NSDictionary *WVPProxyDict(void) {
     if (![mode isEqualToString:@"global"]) {
         // PAC 模式: 只让指定域名走代理, 其余直连
         cache = @{
-            (__bridge NSString *)kCFNetworkProxiesProxyAutoConfigEnable: @YES,
-            (__bridge NSString *)kCFNetworkProxiesProxyAutoConfigJavaScript: WVPPAC(port, host),
+            @"ProxyAutoConfigEnable": @YES,
+            @"ProxyAutoConfigJavaScript": WVPPAC(port, host),
         };
     } else {
         NSNumber *pnum = @(port);
         cache = @{
-            (__bridge NSString *)kCFNetworkProxiesHTTPEnable:  @YES,
-            (__bridge NSString *)kCFNetworkProxiesHTTPProxy:   host,
-            (__bridge NSString *)kCFNetworkProxiesHTTPPort:    pnum,
-            (__bridge NSString *)kCFNetworkProxiesHTTPSEnable: @YES,
-            (__bridge NSString *)kCFNetworkProxiesHTTPSProxy:  host,
-            (__bridge NSString *)kCFNetworkProxiesHTTPSPort:   pnum,
-            (__bridge NSString *)kCFNetworkProxiesExceptionsList:
+            @"HTTPEnable":  @YES,
+            @"HTTPProxy":   host,
+            @"HTTPPort":    pnum,
+            @"HTTPSEnable": @YES,
+            @"HTTPSProxy":  host,
+            @"HTTPSPort":   pnum,
+            @"ExceptionsList":
                 @[@"127.0.0.1", @"localhost", @"::1"],
         };
     }
