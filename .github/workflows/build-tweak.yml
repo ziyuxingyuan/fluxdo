@@ -37,6 +37,30 @@ jobs:
           echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
           echo "$HOME/theos/bin" >> "$GITHUB_PATH"
 
+      - name: Link Linux toolchain into Theos
+        run: |
+          TC="$HOME/theos/toolchain/linux/iphone/bin"
+          mkdir -p "$TC"
+          find_tool() {
+            for c in "$@"; do
+              if command -v "$c" >/dev/null 2>&1; then command -v "$c"; return 0; fi
+              p=$(ls /usr/bin/${c}-* 2>/dev/null | head -n1)
+              if [ -n "$p" ]; then echo "$p"; return 0; fi
+            done
+            return 1
+          }
+          ln -sf "$(find_tool clang)"        "$TC/clang"
+          ln -sf "$(find_tool clang++)"      "$TC/clang++"
+          ln -sf "$(find_tool ld64.lld)"     "$TC/ld64"
+          ln -sf "$(find_tool ld64.lld)"     "$TC/ld"
+          ln -sf "$(find_tool llvm-ar ar)"   "$TC/ar"
+          ln -sf "$(find_tool llvm-ranlib ranlib)" "$TC/ranlib"
+          ln -sf "$(find_tool llvm-strip strip)"   "$TC/strip"
+          ln -sf "$(find_tool llvm-nm nm)"         "$TC/nm"
+          ln -sf "$(find_tool llvm-objcopy objcopy)" "$TC/objcopy"
+          ln -sf /usr/local/bin/ldid "$TC/ldid"
+          ls -la "$TC"
+
       - name: Build deb
         run: |
           make -C tweak clean package THEOS_PACKAGE_SCHEME=rootless FINALPACKAGE=1
