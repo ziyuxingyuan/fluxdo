@@ -1,0 +1,9 @@
+Package: com.fluxdo.webviewproxy
+Name: FluxDo WebView Proxy
+Version: 0.1.0
+Architecture: iphoneos-arm64
+Description: 让 FluxDo 的 WKWebView 走它自己的本地 DoH 代理 (iOS 16)
+Maintainer: fish
+Author: fish
+Section: Tweaks
+Depends: mobilesubstrate
