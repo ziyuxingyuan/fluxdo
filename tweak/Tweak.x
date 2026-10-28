@@ -19,8 +19,6 @@
 #import <UIKit/UIKit.h>
 #import <WebKit/WebKit.h>
 #import <SystemConfiguration/SystemConfiguration.h>
-#import <libproc.h>
-#import <sys/proc_info.h>
 #import <netinet/in.h>
 #import <sys/socket.h>
 #import <sys/time.h>
@@ -161,48 +159,30 @@ static NSDictionary *WVPProxyDict(void) {
     return cache;
 }
 
-#pragma mark - 端口探测 (只在 FluxDo 进程里有效)
-
-static int WVPDetectLocalPort(void) {
-    pid_t pid = getpid();
-    int size = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, NULL, 0);
-    if (size <= 0) return 0;
-
-    struct proc_fdinfo *fds = malloc(size);
-    if (!fds) return 0;
-    int got = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, fds, size);
-    int count = got / (int)sizeof(struct proc_fdinfo);
-    int found = 0;
-
-    for (int i = 0; i < count; i++) {
-        if (fds[i].proc_fdtype != PROX_FDTYPE_SOCKET) continue;
-        struct socket_fdinfo si;
-        memset(&si, 0, sizeof(si));
-        if (proc_pidfdinfo(pid, fds[i].proc_fd, PROC_PIDFDSOCKETINFO,
-                           &si, sizeof(si)) != (int)sizeof(si)) continue;
-        if (si.psi.soi_kind != SOCKINFO_TCP) continue;
-        if (si.psi.soi_proto.pri_tcp.tcpsi_state != TSI_S_LISTEN) continue;
-
-        int port = ntohs(si.psi.soi_proto.pri_tcp.tcpsi_ini.insi_lport);
-        if (port <= 1024 || port >= 65535) continue;
-        if (port == 8181 || port == 50300 || port == 50301) continue;  // Flutter 调试口
-        found = port;
-        break;
-    }
-    free(fds);
-    return found;
-}
-
-static void WVPDetectAndPublish(void) {
-    int port = WVPDetectLocalPort();
-    if (port <= 0) { WVPLog(@"未发现本地监听端口"); return; }
-    int last = [WVPGet(@"DetectedPort") intValue];
-    if (last == port) return;
-    WVPut(@"DetectedPort", @(port));
-    WVPLog(@"探测到本地代理端口 %d 并已写入配置域", port);
-}
+static BOOL gIsApp = NO;
 
 #pragma mark - Hooks
+
+// FluxDo 进程: 本地代理 listen() 时顺手抓到端口
+%hookf(int, listen, int sockfd, int backlog) {
+    int r = %orig;
+    if (r == 0 && gIsApp) {
+        struct sockaddr_in a; socklen_t len = sizeof(a);
+        memset(&a, 0, sizeof(a));
+        if (getsockname(sockfd, (struct sockaddr *)&a, &len) == 0 && a.sin_family == AF_INET) {
+            int port = ntohs(a.sin_port);
+            BOOL loopback = (ntohl(a.sin_addr.s_addr) == INADDR_LOOPBACK);
+            if (loopback && port > 1024 && port < 65535 &&
+                port != 8181 && port != 50300 && port != 50301) {
+                if ([WVPGet(@"DetectedPort") intValue] != port) {
+                    WVPut(@"DetectedPort", @(port));
+                    WVPLog(@"捕获本地监听端口 %d", port);
+                }
+            }
+        }
+    }
+    return r;
+}
 
 %hook NSURLSessionConfiguration
 
@@ -237,12 +217,12 @@ static void WVPDetectAndPublish(void) {
 %hook WKWebView
 
 - (instancetype)initWithFrame:(CGRect)frame configuration:(WKWebViewConfiguration *)configuration {
-    WVPDetectAndPublish();
+    NSDictionary *p = WVPProxyDict();
+    WVPLog(@"新建 WebView, 当前代理端口 %d", p ? WVPActivePort() : 0);
     return %orig;
 }
 
 - (instancetype)initWithCoder:(NSCoder *)coder {
-    WVPDetectAndPublish();
     return %orig;
 }
 
@@ -254,8 +234,8 @@ static void WVPDetectAndPublish(void) {
     WVPLog(@"loaded into %@ (pid %d, app=%d)", bid ?: @"?", getpid(), isApp);
 
     if (isApp) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ WVPDetectAndPublish(); });
+        gIsApp = YES;
+        WVPLog(@"App 进程已就绪, 等待 listen()");
     } else {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
