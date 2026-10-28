@@ -49,10 +49,19 @@ jobs:
             done
             return 1
           }
+          LD64_BIN=$(find_tool ld64.lld ld64.lld-18 ld64.lld-17 || true)
+          if [ -z "$LD64_BIN" ]; then
+            sudo apt-get install -y lld-18 || sudo apt-get install -y lld
+            LD64_BIN=$(find_tool ld64.lld ld64.lld-18 ld64.lld-17 || true)
+          fi
+          if [ -z "$LD64_BIN" ]; then
+            echo "no Mach-O linker available"; ls /usr/bin | grep -i lld || true; exit 1
+          fi
+          echo "ld64 = $LD64_BIN"
           ln -sf "$(find_tool clang)"        "$TC/clang"
           ln -sf "$(find_tool clang++)"      "$TC/clang++"
-          ln -sf "$(find_tool ld64.lld)"     "$TC/ld64"
-          ln -sf "$(find_tool ld64.lld)"     "$TC/ld"
+          ln -sf "$LD64_BIN"                 "$TC/ld64"
+          ln -sf "$LD64_BIN"                 "$TC/ld"
           ln -sf "$(find_tool llvm-ar ar)"   "$TC/ar"
           ln -sf "$(find_tool llvm-ranlib ranlib)" "$TC/ranlib"
           ln -sf "$(find_tool llvm-strip strip)"   "$TC/strip"
