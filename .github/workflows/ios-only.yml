@@ -125,8 +125,9 @@ jobs:
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          # Same as the build job in the original file: iOS leg pins 3.44.0
-          flutter-version: '3.44.0'
+          # Upstream .fvmrc pins 3.47.7; anything older ships Dart 3.12 and
+          # fails on the ^3.13.0 SDK constraint in pubspec.yaml.
+          flutter-version: '3.47.7'
           cache: true
 
       - name: Setup Rust
