@@ -22,7 +22,6 @@
 #import <netinet/in.h>
 #import <sys/socket.h>
 #import <sys/time.h>
-#import <netinet/tcp_fsm.h>
 
 #define WVP_DOMAIN   CFSTR("com.fluxdo.webviewproxy")
 #define WVP_LOG_PATH @"/var/mobile/Library/Logs/WebViewProxy.log"
