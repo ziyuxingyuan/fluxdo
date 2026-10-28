@@ -9,83 +9,23 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: macos-13
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            make git curl xz-utils file libplist-utils dpkg-dev fakeroot \
-            clang lld llvm
-          LDID_URL=$(curl -fsSL https://api.github.com/repos/ProcursusTeam/ldid/releases/latest \
-            | grep -o 'https://[^"]*linux[^"]*x86_64[^"]*' | head -n1)
-          echo "ldid: $LDID_URL"
-          curl -fsSL -o /tmp/ldid "$LDID_URL"
-          chmod +x /tmp/ldid
-          sudo mv /tmp/ldid /usr/local/bin/ldid
-          ldid -v || true
-
       - name: Install Theos
         run: |
+          brew install ldid xz
           git clone --recursive --depth 1 https://github.com/theos/theos.git "$HOME/theos"
           git clone --depth 1 https://github.com/theos/sdks.git /tmp/sdks
           mkdir -p "$HOME/theos/sdks"
           cp -R /tmp/sdks/*.sdk "$HOME/theos/sdks/" || true
-          ls "$HOME/theos/sdks" | head -n 5
           echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
           echo "$HOME/theos/bin" >> "$GITHUB_PATH"
 
-      - name: Link Linux toolchain into Theos
-        run: |
-          TC="$HOME/theos/toolchain/linux/iphone/bin"
-          mkdir -p "$TC"
-          find_tool() {
-            for c in "$@"; do
-              if command -v "$c" >/dev/null 2>&1; then command -v "$c"; return 0; fi
-              p=$(ls /usr/bin/${c}-* 2>/dev/null | head -n1)
-              if [ -n "$p" ]; then echo "$p"; return 0; fi
-            done
-            return 1
-          }
-          LD64_BIN=$(find_tool ld64.lld ld64.lld-18 ld64.lld-17 || true)
-          if [ -z "$LD64_BIN" ]; then
-            sudo apt-get install -y lld-18 || sudo apt-get install -y lld
-            LD64_BIN=$(find_tool ld64.lld ld64.lld-18 ld64.lld-17 || true)
-          fi
-          if [ -z "$LD64_BIN" ]; then
-            echo "no Mach-O linker available"; ls /usr/bin | grep -i lld || true; exit 1
-          fi
-          echo "ld64 = $LD64_BIN"
-          rm -f "$TC/clang" "$TC/clang++"
-          cat > "$TC/clang" <<EOF
-          #!/bin/sh
-          exec /usr/bin/clang -fuse-ld=$TC/ld64 "\$@"
-          EOF
-          cat > "$TC/clang++" <<EOF
-          #!/bin/sh
-          exec /usr/bin/clang++ -fuse-ld=$TC/ld64 "\$@"
-          EOF
-          chmod +x "$TC/clang" "$TC/clang++"
-          ln -sf "$LD64_BIN"                 "$TC/ld64"
-          ln -sf "$LD64_BIN"                 "$TC/ld"
-          ln -sf "$(find_tool llvm-ar ar)"   "$TC/ar"
-          ln -sf "$(find_tool llvm-ranlib ranlib)" "$TC/ranlib"
-          ln -sf "$(find_tool llvm-strip strip)"   "$TC/strip"
-          ln -sf "$(find_tool llvm-nm nm)"         "$TC/nm"
-          ln -sf "$(find_tool llvm-objcopy objcopy)" "$TC/objcopy"
-          ln -sf /usr/local/bin/ldid "$TC/ldid"
-          ls -la "$TC"
-
       - name: Build deb
         run: |
-          TC="$HOME/theos/toolchain/linux/iphone/bin"
-          export PATH="$TC:$PATH"
-          ls -l "$TC" || true
-          test -x "$TC/ld64" || { echo "ld64 link missing"; exit 1; }
-          "$TC/ld64" --version 2>&1 | head -n 3 || true
-          make -C tweak clean package THEOS_PACKAGE_SCHEME=rootless FINALPACKAGE=1 LD="$TC/ld64"
+          make -C tweak clean package THEOS_PACKAGE_SCHEME=rootless FINALPACKAGE=1
 
       - name: Show result
         run: ls -lh tweak/packages/ || true
