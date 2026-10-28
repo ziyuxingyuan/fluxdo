@@ -72,7 +72,12 @@ jobs:
 
       - name: Build deb
         run: |
-          make -C tweak clean package THEOS_PACKAGE_SCHEME=rootless FINALPACKAGE=1
+          TC="$HOME/theos/toolchain/linux/iphone/bin"
+          export PATH="$TC:$PATH"
+          ls -l "$TC" || true
+          test -x "$TC/ld64" || { echo "ld64 link missing"; exit 1; }
+          "$TC/ld64" --version 2>&1 | head -n 3 || true
+          make -C tweak clean package THEOS_PACKAGE_SCHEME=rootless FINALPACKAGE=1 LD="$TC/ld64"
 
       - name: Show result
         run: ls -lh tweak/packages/ || true
