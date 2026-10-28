@@ -1,0 +1,6 @@
+{
+    Filter = (
+        { Bundles = ( "com.github.lingyan000.fluxdo" ); },
+        { Executables = ( "com.apple.WebKit.Networking" ); }
+    );
+}
