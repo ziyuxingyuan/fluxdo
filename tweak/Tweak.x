@@ -95,10 +95,9 @@ static NSString *WVPPAC(int port, NSString *proxyHost) {
     static NSString *cached = nil;
     static int cachedPort = -1;
     if (cached && cachedPort == port) return cached;
-    NSString *suffixes = WVPGet(@"Domains");
-    if (![suffixes isKindOfClass:[NSArray class]] || ![suffixes count]) {
-        suffixes = @[@"linux.do"];
-    }
+    id domains = WVPGet(@"Domains");
+    NSArray *suffixes = [domains isKindOfClass:[NSArray class]]
+        ? (NSArray *)domains : @[@"linux.do"];
     NSMutableString *js = [NSMutableString stringWithString:@"function FindProxyForURL(url, host) {"];
     for (NSString *d in suffixes) {
         [js appendFormat:@"  if (host == '%@' || dnsDomainIs(host, '.%@')) return 'PROXY %@:%d; DIRECT';",
@@ -206,12 +205,6 @@ static BOOL gIsApp = NO;
 }
 
 %end
-
-%hookf(CFDictionaryRef, SCDynamicStoreCopyProxies, SCDynamicStoreRef store) {
-    NSDictionary *p = WVPProxyDict();
-    if (p) return (CFDictionaryRef)CFBridgingRetain([p copy]);
-    return %orig;
-}
 
 %hook WKWebView
 
