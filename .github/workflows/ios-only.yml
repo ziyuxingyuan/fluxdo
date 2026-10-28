@@ -10,15 +10,9 @@ name: Build iOS (unsigned IPA)
 #
 # Triggers:
 #   workflow_dispatch - run by hand from the Actions tab
-#   schedule          - daily check; the build is skipped entirely when
-#                       1molchuan/cfluxdo has no commit newer than the last
-#                       successful build
 #   push tags v*      - kept from the original build.yaml
 on:
   workflow_dispatch:
-  schedule:
-    # 20:00 UTC = 04:00 Asia/Shanghai
-    - cron: '0 20 * * *'
   push:
     tags:
       - 'v*'
