@@ -1,0 +1,36 @@
+name: Build tweak
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'tweak/**'
+      - '.github/workflows/build-tweak.yml'
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Theos
+        run: |
+          brew install ldid xz
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "$HOME/theos"
+          git clone --depth 1 https://github.com/theos/sdks.git /tmp/sdks
+          mkdir -p "$HOME/theos/sdks"
+          cp -R /tmp/sdks/*.sdk "$HOME/theos/sdks/"
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+
+      - name: Build deb
+        run: |
+          make -C tweak clean package THEOS_PACKAGE_SCHEME=rootless FINALPACKAGE=1
+
+      - name: Show artifacts
+        run: ls -lh tweak/packages/ || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: webviewproxy-deb
+          path: tweak/packages/*.deb
+          if-no-files-found: error
