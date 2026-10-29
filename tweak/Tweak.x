@@ -1,13 +1,13 @@
-// WebViewProxy 0.1.2 - 让 FluxDo 的 WKWebView 走它自己的本地 DoH 代理
+// WebViewProxy 0.1.3 - 让 FluxDo 的 WKWebView 走它自己的本地 DoH 代理
 // 适用: Dopamine (rootless) iOS 15.0 - 16.6.1
 //
-// 0.1.2 相比 0.1.1 的改动:
+// 0.1.3 相比 0.1.1 的改动:
 //   1) filter plist 改用 Executables 匹配 com.apple.WebKit.Networking
 //      (XPC 服务不走 Bundles 匹配, 之前从未注入成功)
 //   2) 放弃 NSURLSessionConfiguration.connectionProxyDictionary,
 //      WKWebView 不创建 NSURLSessionConfiguration, 改为 hook
-//      CFNetworkCopySystemProxySettings / SCDynamicStoreCopyProxies
-//      (CFNetwork 真正读取系统代理的入口)
+//      CFNetworkCopySystemProxySettings (CFNetwork 真正读系统代理的入口;
+//      SCDynamicStoreCopyProxies 在 iOS SDK 里 unavailable, 不能用)
 //   3) 解决跨进程端口传递: CFPreferences 按 App 容器隔离, WebKit 进程
 //      读不到 App 探测出的端口。改为 App 进程内起一个固定端口(65530)的
 //      TCP 转发器, WebKit 侧硬编码连它; App 退出转发器即消失, 天然兜底。
@@ -44,7 +44,6 @@
 #define WVP_MAX_HEAD    8192
 
 extern CFDictionaryRef CFNetworkCopySystemProxySettings(void);
-extern CFDictionaryRef SCDynamicStoreCopyProxies(SCDynamicStoreRef store);
 
 #pragma mark - 日志
 
@@ -417,7 +416,8 @@ static BOOL WVPIsWebKitNet(void) {
 
 #pragma mark - Hooks
 
-// 系统代理设置: CFNetwork 与 SCDynamicStore 两个入口都接管
+// 系统代理设置: iOS 上 CFNetwork 读取系统代理的唯一入口
+// (SCDynamicStoreCopyProxies 在 iOS SDK 里被标记为 unavailable, 不能用)
 %hookf(CFDictionaryRef, CFNetworkCopySystemProxySettings) {
     if (WVPIsWebKitNet()) {
         NSDictionary *p = WVPProxyDict();
@@ -427,14 +427,6 @@ static BOOL WVPIsWebKitNet(void) {
             if (now - lastLog > 10) { lastLog = now; WVPLog(@"CFNetwork 取代理 -> %d", WVP_RELAY_PORT); }
             return (CFDictionaryRef)CFBridgingRetain(p);
         }
-    }
-    return %orig;
-}
-
-%hookf(CFDictionaryRef, SCDynamicStoreCopyProxies, SCDynamicStoreRef store) {
-    if (WVPIsWebKitNet()) {
-        NSDictionary *p = WVPProxyDict();
-        if (p) return (CFDictionaryRef)CFBridgingRetain(p);
     }
     return %orig;
 }
@@ -507,7 +499,7 @@ static BOOL WVPIsWebKitNet(void) {
     BOOL isNet = WVPIsWebKitNet();
     gIsApp = isApp;
 
-    WVPLog(@"=== 0.1.2 loaded into %@ (pid %d, app=%d, wknet=%d) ===",
+    WVPLog(@"=== 0.1.3 loaded into %@ (pid %d, app=%d, wknet=%d) ===",
            bid ?: @"?", getpid(), isApp, isNet);
 
     if (isApp) {
