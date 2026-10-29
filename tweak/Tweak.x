@@ -1,4 +1,4 @@
-// WebViewProxy 0.1.10 - 让 FluxDo 的 WKWebView 走它自己的本地 DoH 代理
+// WebViewProxy 0.1.11 - 让 FluxDo 的 WKWebView 走它自己的本地 DoH 代理
 // 适用: Dopamine (rootless) iOS 15.0 - 16.6.1
 //
 // 0.1.4 相比 0.1.1 的改动:
@@ -75,6 +75,12 @@ static volatile int gNsCfgDefault  = 0;  // +defaultSessionConfiguration 被调�
 static volatile int gNsCfgEphemeral= 0;  // +ephemeralSessionConfiguration 被调次数
 static volatile int gConnRelay     = 0;  // connect() 到 127.0.0.1:65530 的次数
 static volatile int gConnTotal     = 0;  // connect() 总次数(本进程)
+// 0.1.11: 信标跟随 FluxDo 生命周期。
+// com.apple.WebKit.Networking 是系统常驻进程, 注入后信标会一直监听,
+// 即使 FluxDo 已经退出。这里用看门狗盯住转发器 65530:
+// 每秒探测一次, 连续 3 次不通(约 3 秒)就关掉信标; 转发器回来后自动重开。
+#define WVP_BEACON_DEAD_TRIES 3
+static int gBeaconFd = -1;              // 当前监听中的信标 fd, -1 表示未监听
 static volatile int gRelayConns  = 0;  // 转发器 accept 到的连接总数
 static volatile int gPumpUp      = 0;  // 客户端 -> 上游 的字节数
 static volatile int gPumpDown    = 0;  // 上游 -> 客户端 的字节数
@@ -550,7 +556,7 @@ static void *WVPBeaconClient(void *arg) {
 
     char body[1024];
     int blen = snprintf(body, sizeof(body),
-        "ver=0.1.10 pid=%d app=%d wknet=%d\n"
+        "ver=0.1.11 pid=%d app=%d wknet=%d\n"
         "sysCalls=%d sysHit=%d sysMiss=%d\n"
         "forURLCalls=%d forURLHit=%d autoCfgCalls=%d\n"
         "relayPort=%d relayConns=%d up=%d down=%d\n"
@@ -579,10 +585,16 @@ static void *WVPBeaconClient(void *arg) {
 }
 
 static void *WVPBeaconAccept(void *arg) {
-    int lfd = (int)(intptr_t)arg;
+    (void)arg;
     for (;;) {
+        int lfd = gBeaconFd;
+        if (lfd < 0) break;                 // 看门狗已关闭, 线程退出
         int cfd = accept(lfd, NULL, NULL);
-        if (cfd < 0) { usleep(50000); continue; }
+        if (cfd < 0) {
+            if (gBeaconFd < 0) break;       // 关闭导致的失败, 退出
+            usleep(50000);
+            continue;
+        }
         pthread_t t;
         if (pthread_create(&t, NULL, WVPBeaconClient, (void *)(intptr_t)cfd) == 0) pthread_detach(t);
         else close(cfd);
@@ -590,25 +602,63 @@ static void *WVPBeaconAccept(void *arg) {
     return NULL;
 }
 
-static void WVPStartBeacon(int port) {
-    static int used[WVP_BEACON_SLOTS];
-    static int n = 0;
-    for (int i = 0; i < n; i++) if (used[i] == port) return;
-    if (n < WVP_BEACON_SLOTS) used[n++] = port;
+static BOOL WVPStartBeacon(int port) {
+    if (gBeaconFd >= 0) return YES;         // 已经在监听
 
     int lfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (lfd < 0) return;
+    if (lfd < 0) return NO;
     int one = 1;
     setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons((uint16_t)port);
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) != 0) { close(lfd); return; }
-    if (listen(lfd, 16) != 0) { close(lfd); return; }
+    if (bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) != 0) { close(lfd); return NO; }
+    if (listen(lfd, 16) != 0) { close(lfd); return NO; }
+    gBeaconFd = lfd;
     pthread_t t;
-    if (pthread_create(&t, NULL, WVPBeaconAccept, (void *)(intptr_t)lfd) == 0) pthread_detach(t);
-    else close(lfd);
+    if (pthread_create(&t, NULL, WVPBeaconAccept, NULL) == 0) pthread_detach(t);
+    else { gBeaconFd = -1; close(lfd); return NO; }
+    return YES;
+}
+
+// 关掉信标监听; accept 线程会自己退出。
+static void WVPStopBeacon(void) {
+    int fd = gBeaconFd;
+    gBeaconFd = -1;
+    if (fd >= 0) close(fd);
+}
+
+// 看门狗: 每秒探测转发器, 连续 WVP_BEACON_DEAD_TRIES 次不通就关信标,
+// 恢复后自动重开。只在 WebKit 网络进程里跑(App 进程的信标随 App 存亡, 不需要)。
+static void *WVPBeaconWatchdog(void *arg) {
+    int port = (int)(intptr_t)arg;
+    int dead = 0;
+    BOOL logState = NO;
+    for (;;) {
+        sleep(1);
+        BOOL alive = WVPPortAlive(WVP_RELAY_PORT);
+        if (alive) {
+            dead = 0;
+            if (gBeaconFd < 0) {
+                if (WVPStartBeacon(port) && !logState) {
+                    WVPLog(@"信标恢复监听 %d (转发器已就绪)", port);
+                    logState = YES;
+                }
+            }
+        } else {
+            if (gBeaconFd >= 0 && ++dead >= WVP_BEACON_DEAD_TRIES) {
+                WVPStopBeacon();
+                logState = NO;
+            }
+        }
+    }
+    return NULL;
+}
+
+static void WVPStartBeaconWatchdog(int port) {
+    pthread_t t;
+    if (pthread_create(&t, NULL, WVPBeaconWatchdog, (void *)(intptr_t)port) == 0) pthread_detach(t);
 }
 
 #pragma mark - Hooks
@@ -733,11 +783,15 @@ static void WVPStartBeacon(int port) {
     BOOL isNet = WVPIsWebKitNet();
     gIsApp = isApp;
 
-    WVPLog(@"=== 0.1.10 loaded into %@ (pid %d, app=%d, wknet=%d) ===",
+    WVPLog(@"=== 0.1.11 loaded into %@ (pid %d, app=%d, wknet=%d) ===",
            bid ?: @"?", getpid(), isApp, isNet);
 
     // 信标先起, 哪怕后面全部失败也能被 SSH 看到
-    WVPStartBeacon(isApp ? WVP_BEACON_APP : (isNet ? WVP_BEACON_WKNET : WVP_BEACON_OTHER));
+    // App 进程: 信标随 App 存亡, 不需要看门狗
+    // 网络进程: 系统常驻, 必须由看门狗跟住转发器
+    int bport = isApp ? WVP_BEACON_APP : (isNet ? WVP_BEACON_WKNET : WVP_BEACON_OTHER);
+    WVPStartBeacon(bport);
+    if (!isApp) WVPStartBeaconWatchdog(bport);
 
     if (isApp) {
         WVPStartRelay();
