@@ -1,36 +1,53 @@
-// WebViewProxy - 让 FluxDo 的 WKWebView 走它自己的本地 DoH 代理
+// WebViewProxy 0.1.2 - 让 FluxDo 的 WKWebView 走它自己的本地 DoH 代理
 // 适用: Dopamine (rootless) iOS 15.0 - 16.6.1
 //
-// 原理:
-//   FluxDo 用 Rust (doh_proxy) 在 127.0.0.1 上起一个 HTTP CONNECT 代理,
-//   端口运行时随机分配。App 自己的 Dart 请求已经走它, 但 WKWebView 的请求
-//   跑在独立的 com.apple.WebKit.Networking 进程里, 拿不到这份配置。
-//   本插件做两件事:
-//     1) 在 FluxDo 进程里枚举自己的 LISTEN socket, 找出代理端口,
-//        写进 CFPreferences 域 com.fluxdo.webviewproxy 的 DetectedPort
-//     2) 在 WebKit 网络进程里 hook NSURLSessionConfiguration 与
-//        SCDynamicStoreCopyProxies, 强制返回这个代理
+// 0.1.2 相比 0.1.1 的改动:
+//   1) filter plist 改用 Executables 匹配 com.apple.WebKit.Networking
+//      (XPC 服务不走 Bundles 匹配, 之前从未注入成功)
+//   2) 放弃 NSURLSessionConfiguration.connectionProxyDictionary,
+//      WKWebView 不创建 NSURLSessionConfiguration, 改为 hook
+//      CFNetworkCopySystemProxySettings / SCDynamicStoreCopyProxies
+//      (CFNetwork 真正读取系统代理的入口)
+//   3) 解决跨进程端口传递: CFPreferences 按 App 容器隔离, WebKit 进程
+//      读不到 App 探测出的端口。改为 App 进程内起一个固定端口(65530)的
+//      TCP 转发器, WebKit 侧硬编码连它; App 退出转发器即消失, 天然兜底。
+//   4) 域名白名单放在转发器里判断: 非白名单的 CONNECT 直接 TCP 隧道,
+//      不经 Rust 代理 MITM, 避免污染其它 App 的 WebView。
+//   5) NSURLSessionConfiguration hook 只在 WebKit 进程生效,
+//      不再拖死 App 自身的 URLSession。
 //
-// 前提:
-//   FluxDo 的代理对 CONNECT 做 TLS 解密(MITM), 必须先把它的 CA 证书装进
-//   系统信任库, 否则所有 HTTPS 都会报证书错误。
+// 前提: FluxDo 的代理对 CONNECT 做 TLS 解密(MITM), CA 必须已装进系统信任库。
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <WebKit/WebKit.h>
 #import <SystemConfiguration/SystemConfiguration.h>
 #import <netinet/in.h>
+#import <netinet/tcp.h>
+#import <netdb.h>
+#import <arpa/inet.h>
 #import <sys/socket.h>
 #import <sys/time.h>
+#import <sys/select.h>
+#import <pthread.h>
+#import <fcntl.h>
+#import <errno.h>
+#import <unistd.h>
+#import <stdio.h>
+#import <stdlib.h>
+#import <string.h>
 
-#define WVP_DOMAIN   CFSTR("com.fluxdo.webviewproxy")
-#define WVP_LOG_PATH @"/var/mobile/Library/Logs/WebViewProxy.log"
-#define WVP_APP_BID  @"com.github.lingyan000.fluxdo"
+#define WVP_DOMAIN      CFSTR("com.fluxdo.webviewproxy")
+#define WVP_APP_BID     @"com.github.lingyan000.fluxdo"
+#define WVP_WK_BID      @"com.apple.WebKit.Networking"
+#define WVP_RELAY_PORT  65530
+#define WVP_MAX_HEAD    8192
 
-// 日志: 依次尝试多个位置, 哪个真能写就用哪个
-//   1) 进程容器内的 tmp/      (沙盒内必定可写)
-//   2) /var/mobile/Library/Logs/  (越权运行的进程)
-//   3) /tmp/
+extern CFDictionaryRef CFNetworkCopySystemProxySettings(void);
+extern CFDictionaryRef SCDynamicStoreCopyProxies(SCDynamicStoreRef store);
+
+#pragma mark - 日志
+
 static NSString *WVPWriteLine(NSString *path, NSString *line) {
     NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -40,7 +57,7 @@ static NSString *WVPWriteLine(NSString *path, NSString *line) {
     if (![fm fileExistsAtPath:path])
         [fm createFileAtPath:path contents:nil attributes:nil];
     NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
-    if (!fh) return nil;                    // 沙盒拒绝打开 -> 换下一个候选
+    if (!fh) return nil;
     @try {
         [fh seekToEndOfFile];
         [fh writeData:data];
@@ -56,7 +73,7 @@ static void WVPLog(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
-    NSLog(@"[WebViewProxy] %@", msg);       // 系统日志兜底, 不受沙盒限制
+    NSLog(@"[WebViewProxy] %@", msg);
 
     static NSArray *cands = nil;
     static NSUInteger idx = 0;
@@ -84,6 +101,8 @@ static void WVPLog(NSString *fmt, ...) {
     }
 }
 
+#pragma mark - 配置
+
 static id WVPGet(NSString *key) {
     CFPropertyListRef v = CFPreferencesCopyAppValue((__bridge CFStringRef)key, WVP_DOMAIN);
     return v ? CFBridgingRelease(v) : nil;
@@ -101,8 +120,8 @@ static BOOL WVPEnabled(void) {
 
 static int WVPActivePort(void) {
     int p = [WVPGet(@"Port") intValue];
-    if (p > 0 && p < 65536) return p;            // 手填优先
-    return [WVPGet(@"DetectedPort") intValue];   // 否则用探测值
+    if (p > 0 && p < 65536) return p;
+    return [WVPGet(@"DetectedPort") intValue];
 }
 
 static NSString *WVPProxyHost(void) {
@@ -110,7 +129,32 @@ static NSString *WVPProxyHost(void) {
     return h.length ? h : @"127.0.0.1";
 }
 
-// 本地端口是否真的在监听 (本地 connect, 阻塞极短)
+static BOOL WVPGlobalMode(void) {
+    NSString *mode = WVPGet(@"Mode");
+    return [mode isEqualToString:@"global"];
+}
+
+static NSArray<NSString *> *WVPDomains(void) {
+    id d = WVPGet(@"Domains");
+    if ([d isKindOfClass:[NSArray class]] && [(NSArray *)d count]) return (NSArray *)d;
+    return @[@"linux.do"];
+}
+
+static BOOL WVPShouldProxyHost(NSString *host) {
+    if (WVPGlobalMode()) return YES;
+    if (!host.length) return NO;
+    NSString *h = [host lowercaseString];
+    for (NSString *d in WVPDomains()) {
+        NSString *dl = [[d description] lowercaseString];
+        if (!dl.length) continue;
+        if ([h isEqualToString:dl]) return YES;
+        if ([h hasSuffix:[@"." stringByAppendingString:dl]]) return YES;
+    }
+    return NO;
+}
+
+#pragma mark - socket 工具
+
 static BOOL WVPPortAlive(int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return NO;
@@ -125,78 +169,277 @@ static BOOL WVPPortAlive(int port) {
     return r == 0;
 }
 
-// 只对这些域名走代理, 其余 DIRECT
-static NSString *WVPPAC(int port, NSString *proxyHost) {
-    static NSString *cached = nil;
-    static int cachedPort = -1;
-    if (cached && cachedPort == port) return cached;
-    id domains = WVPGet(@"Domains");
-    NSArray *suffixes = [domains isKindOfClass:[NSArray class]]
-        ? (NSArray *)domains : @[@"linux.do"];
-    NSMutableString *js = [NSMutableString stringWithString:@"function FindProxyForURL(url, host) {"];
-    for (NSString *d in suffixes) {
-        [js appendFormat:@"  if (host == '%@' || dnsDomainIs(host, '.%@')) return 'PROXY %@:%d; DIRECT';",
-            d, d, proxyHost, port];
+// 带超时的 TCP 连接, 成功返回 fd, 失败 -1
+static int WVPConnectHost(NSString *host, int port, int timeoutMs) {
+    if (!host.length || port <= 0 || port > 65535) return -1;
+    struct addrinfo hints; memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    char portstr[8]; snprintf(portstr, sizeof(portstr), "%d", port);
+    struct addrinfo *res = NULL;
+    if (getaddrinfo([host UTF8String], portstr, &hints, &res) != 0 || !res) return -1;
+    int fd = -1;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        fd = socket(ai->ai_family, ai->ai_socktype, 0);
+        if (fd < 0) continue;
+        int flags = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        int r = connect(fd, ai->ai_addr, ai->ai_addrlen);
+        if (r == 0) { fcntl(fd, F_SETFL, flags); break; }
+        if (errno == EINPROGRESS) {
+            fd_set wfds; FD_ZERO(&wfds); FD_SET(fd, &wfds);
+            struct timeval tv; tv.tv_sec = timeoutMs / 1000; tv.tv_usec = (timeoutMs % 1000) * 1000;
+            if (select(fd + 1, NULL, &wfds, NULL, &tv) > 0) {
+                int err = 0; socklen_t len = sizeof(err);
+                getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len);
+                if (err == 0) { fcntl(fd, F_SETFL, flags); break; }
+            }
+        }
+        close(fd); fd = -1;
     }
-    [js appendString:@"  return 'DIRECT';\n}"];
-    cached = [js copy];
-    cachedPort = port;
-    return cached;
+    freeaddrinfo(res);
+    return fd;
 }
+
+static void WVPPump(int from, int to) {
+    char buf[16384];
+    for (;;) {
+        ssize_t n = recv(from, buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        ssize_t off = 0;
+        while (off < n) {
+            ssize_t w = send(to, buf + off, (size_t)(n - off), 0);
+            if (w <= 0) { shutdown(from, SHUT_RDWR); return; }
+            off += w;
+        }
+    }
+    shutdown(to, SHUT_WR);
+}
+
+typedef struct { int a; int b; } WVPPumpArgs;
+
+static void *WVPPumpThread(void *arg) {
+    WVPPumpArgs *p = (WVPPumpArgs *)arg;
+    WVPPump(p->a, p->b);
+    free(p);
+    return NULL;
+}
+
+#pragma mark - 固定端口转发器 (App 进程内)
+
+static void *WVPClientThread(void *arg) {
+    int cfd = (int)(intptr_t)arg;
+
+    struct timeval tv; tv.tv_sec = 3; tv.tv_usec = 0;
+    setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    char head[WVP_MAX_HEAD + 1];
+    size_t hlen = 0;
+    while (hlen < WVP_MAX_HEAD) {
+        ssize_t n = recv(cfd, head + hlen, WVP_MAX_HEAD - hlen, 0);
+        if (n <= 0) { close(cfd); return NULL; }
+        hlen += (size_t)n;
+        head[hlen] = 0;
+        if (strstr(head, "\r\n\r\n")) break;
+    }
+    head[hlen] = 0;
+    if (!hlen) { close(cfd); return NULL; }
+
+    char method[16] = {0}, target[1024] = {0};
+    if (sscanf(head, "%15s %1023s", method, target) != 2) { close(cfd); return NULL; }
+
+    BOOL isConnect = (strcmp(method, "CONNECT") == 0);
+    NSString *host = nil;
+    int port = 0;
+
+    if (isConnect) {
+        NSString *hp = [NSString stringWithUTF8String:target];
+        NSRange colon = [hp rangeOfString:@":" options:NSBackwardsSearch];
+        if (colon.location != NSNotFound) {
+            host = [hp substringToIndex:colon.location];
+            port = [[hp substringFromIndex:colon.location + 1] intValue];
+        } else {
+            host = hp; port = 443;
+        }
+    } else {
+        NSString *url = [NSString stringWithUTF8String:target];
+        NSURL *u = [NSURL URLWithString:url];
+        host = u.host;
+        port = u.port ? [u.port intValue] : 80;
+    }
+
+    int upfd = -1;
+    BOOL viaProxy = WVPShouldProxyHost(host);
+
+    if (viaProxy) {
+        int pport = WVPActivePort();
+        if (pport > 0 && pport != WVP_RELAY_PORT) {
+            upfd = WVPConnectHost(@"127.0.0.1", pport, 3000);
+        }
+    } else {
+        upfd = WVPConnectHost(host, port, 5000);
+        // 直连时由我们自己回 200 Connection Established
+        if (upfd >= 0 && isConnect) {
+            const char *ok = "HTTP/1.1 200 Connection Established\r\n\r\n";
+            send(cfd, ok, strlen(ok), 0);
+        }
+    }
+
+    if (upfd < 0) {
+        const char *err = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
+        send(cfd, err, strlen(err), 0);
+        close(cfd);
+        return NULL;
+    }
+
+    // 首包转发规则:
+    //   CONNECT + 走代理 -> 把 CONNECT 头转给 Rust 代理, 由它回 200
+    //   CONNECT + 直连   -> 上面已自行回 200, 头不能转
+    //   非 CONNECT       -> 头就是要转发的请求本身
+    BOOL forwardHead = isConnect ? viaProxy : YES;
+    if (forwardHead && hlen) {
+        ssize_t off = 0;
+        while (off < (ssize_t)hlen) {
+            ssize_t w = send(upfd, head + off, hlen - (size_t)off, 0);
+            if (w <= 0) { close(cfd); close(upfd); return NULL; }
+            off += w;
+        }
+    }
+
+    struct timeval tv2; tv2.tv_sec = 0; tv2.tv_usec = 0;
+    setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv2, sizeof(tv2));
+    setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv2, sizeof(tv2));
+    setsockopt(upfd, SOL_SOCKET, SO_RCVTIMEO, &tv2, sizeof(tv2));
+    setsockopt(upfd, SOL_SOCKET, SO_SNDTIMEO, &tv2, sizeof(tv2));
+
+    WVPPumpArgs *args = malloc(sizeof(WVPPumpArgs));
+    args->a = upfd;
+    args->b = cfd;
+    pthread_t t;
+    if (pthread_create(&t, NULL, WVPPumpThread, args) == 0) pthread_detach(t);
+    else free(args);
+
+    WVPPump(cfd, upfd);
+    close(cfd);
+    return NULL;
+}
+
+static void *WVPAcceptLoop(void *arg) {
+    int lfd = (int)(intptr_t)arg;
+    for (;;) {
+        int cfd = accept(lfd, NULL, NULL);
+        if (cfd < 0) { usleep(20000); continue; }
+        int one = 1;
+        setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        pthread_t t;
+        if (pthread_create(&t, NULL, WVPClientThread, (void *)(intptr_t)cfd) == 0) pthread_detach(t);
+        else close(cfd);
+    }
+    return NULL;
+}
+
+static void WVPStartRelay(void) {
+    static BOOL started = NO;
+    if (started) return;
+    started = YES;
+
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (lfd < 0) { WVPLog(@"转发器 socket 创建失败: %d", errno); return; }
+    int one = 1;
+    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(WVP_RELAY_PORT);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    if (bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        WVPLog(@"转发器 bind %d 失败: %d (端口被占用?)", WVP_RELAY_PORT, errno);
+        close(lfd);
+        return;
+    }
+    if (listen(lfd, 128) != 0) {
+        WVPLog(@"转发器 listen 失败: %d", errno);
+        close(lfd);
+        return;
+    }
+    pthread_t t;
+    if (pthread_create(&t, NULL, WVPAcceptLoop, (void *)(intptr_t)lfd) == 0) {
+        pthread_detach(t);
+        WVPLog(@"转发器已监听 127.0.0.1:%d -> 代理端口(动态)", WVP_RELAY_PORT);
+    } else {
+        WVPLog(@"转发器线程创建失败");
+        close(lfd);
+    }
+}
+
+#pragma mark - 代理字典
 
 static NSDictionary *WVPProxyDict(void) {
     static NSDictionary *cache = nil;
     static time_t lastCheck = 0;
-    static int lastWarnPort = -1;
     time_t now = time(NULL);
     if (cache && now - lastCheck < 2) return cache;
     lastCheck = now;
     cache = nil;
 
     if (!WVPEnabled()) return nil;
+    // 转发器没起来(FluxDo 没运行)就交还原设置, 不碰别人的 WebView
+    if (!WVPPortAlive(WVP_RELAY_PORT)) return nil;
 
-    int port = WVPActivePort();
-    if (port <= 0 || port > 65535) return nil;
-
-    // 端口必须真的在监听, 否则 FluxDo 没开代理时会把别人的 WebView 打瘫
-    if (!WVPPortAlive(port)) {
-        if (lastWarnPort != port) {
-            WVPLog(@"端口 %d 无监听, 暂不接管", port);
-            lastWarnPort = port;
-        }
-        return nil;
-    }
-    lastWarnPort = -1;
-
-    NSString *host = WVPProxyHost();
-    NSString *mode = WVPGet(@"Mode");
-    if (![mode isEqualToString:@"global"]) {
-        // PAC 模式: 只让指定域名走代理, 其余直连
-        cache = @{
-            @"ProxyAutoConfigEnable": @YES,
-            @"ProxyAutoConfigJavaScript": WVPPAC(port, host),
-        };
-    } else {
-        NSNumber *pnum = @(port);
-        cache = @{
-            @"HTTPEnable":  @YES,
-            @"HTTPProxy":   host,
-            @"HTTPPort":    pnum,
-            @"HTTPSEnable": @YES,
-            @"HTTPSProxy":  host,
-            @"HTTPSPort":   pnum,
-            @"ExceptionsList":
-                @[@"127.0.0.1", @"localhost", @"::1"],
-        };
-    }
+    cache = @{
+        @"HTTPEnable":  @YES,
+        @"HTTPProxy":   @"127.0.0.1",
+        @"HTTPPort":    @(WVP_RELAY_PORT),
+        @"HTTPSEnable": @YES,
+        @"HTTPSProxy":  @"127.0.0.1",
+        @"HTTPSPort":   @(WVP_RELAY_PORT),
+        @"ExceptionsList": @[@"127.0.0.1", @"localhost", @"::1"],
+    };
     return cache;
 }
 
+#pragma mark - 进程识别
+
 static BOOL gIsApp = NO;
+static BOOL gIsWKNet = NO;
+
+static BOOL WVPIsWebKitNet(void) {
+    static BOOL computed = NO;
+    if (computed) return gIsWKNet;
+    computed = YES;
+    NSString *name = [[NSProcessInfo processInfo] processName];
+    NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+    gIsWKNet = [name isEqualToString:WVP_WK_BID] || [bid isEqualToString:WVP_WK_BID];
+    return gIsWKNet;
+}
 
 #pragma mark - Hooks
 
-// FluxDo 进程: 本地代理 listen() 时顺手抓到端口
+// 系统代理设置: CFNetwork 与 SCDynamicStore 两个入口都接管
+%hookf(CFDictionaryRef, CFNetworkCopySystemProxySettings) {
+    if (WVPIsWebKitNet()) {
+        NSDictionary *p = WVPProxyDict();
+        if (p) {
+            static time_t lastLog = 0;
+            time_t now = time(NULL);
+            if (now - lastLog > 10) { lastLog = now; WVPLog(@"CFNetwork 取代理 -> %d", WVP_RELAY_PORT); }
+            return (CFDictionaryRef)CFBridgingRetain(p);
+        }
+    }
+    return %orig;
+}
+
+%hookf(CFDictionaryRef, SCDynamicStoreCopyProxies, SCDynamicStoreRef store) {
+    if (WVPIsWebKitNet()) {
+        NSDictionary *p = WVPProxyDict();
+        if (p) return (CFDictionaryRef)CFBridgingRetain(p);
+    }
+    return %orig;
+}
+
+// FluxDo 进程: 本地代理 listen() 时抓到端口
 %hookf(int, listen, int sockfd, int backlog) {
     int r = %orig;
     if (r == 0 && gIsApp) {
@@ -206,7 +449,7 @@ static BOOL gIsApp = NO;
             int port = ntohs(a.sin_port);
             BOOL loopback = (ntohl(a.sin_addr.s_addr) == INADDR_LOOPBACK);
             if (loopback && port > 1024 && port < 65535 &&
-                port != 8181 && port != 50300 && port != 50301) {
+                port != 8181 && port != 50300 && port != 50301 && port != WVP_RELAY_PORT) {
                 if ([WVPGet(@"DetectedPort") intValue] != port) {
                     WVPut(@"DetectedPort", @(port));
                     WVPLog(@"捕获本地监听端口 %d", port);
@@ -217,56 +460,61 @@ static BOOL gIsApp = NO;
     return r;
 }
 
+// 只在 WebKit 网络进程里接管 NSURLSessionConfiguration (App 自身不受影响)
 %hook NSURLSessionConfiguration
 
 - (NSDictionary *)connectionProxyDictionary {
-    NSDictionary *p = WVPProxyDict();
-    if (p) return p;
+    if (WVPIsWebKitNet()) {
+        NSDictionary *p = WVPProxyDict();
+        if (p) return p;
+    }
     return %orig;
 }
 
 + (NSURLSessionConfiguration *)defaultSessionConfiguration {
     NSURLSessionConfiguration *c = %orig();
-    NSDictionary *p = WVPProxyDict();
-    if (p) c.connectionProxyDictionary = p;
+    if (WVPIsWebKitNet()) {
+        NSDictionary *p = WVPProxyDict();
+        if (p) c.connectionProxyDictionary = p;
+    }
     return c;
 }
 
 + (NSURLSessionConfiguration *)ephemeralSessionConfiguration {
     NSURLSessionConfiguration *c = %orig();
-    NSDictionary *p = WVPProxyDict();
-    if (p) c.connectionProxyDictionary = p;
+    if (WVPIsWebKitNet()) {
+        NSDictionary *p = WVPProxyDict();
+        if (p) c.connectionProxyDictionary = p;
+    }
     return c;
 }
 
 %end
 
 %hook WKWebView
-
 - (instancetype)initWithFrame:(CGRect)frame configuration:(WKWebViewConfiguration *)configuration {
-    NSDictionary *p = WVPProxyDict();
-    WVPLog(@"新建 WebView, 当前代理端口 %d", p ? WVPActivePort() : 0);
+    if (gIsApp) {
+        WVPLog(@"新建 WebView, 代理端口 %d, 转发器端口 %d", WVPActivePort(), WVP_RELAY_PORT);
+    }
     return %orig;
 }
-
-- (instancetype)initWithCoder:(NSCoder *)coder {
-    return %orig;
-}
-
 %end
 
 %ctor {
     NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
-    BOOL isApp = [bid isEqualToString:WVP_APP_BID];
-    WVPLog(@"loaded into %@ (pid %d, app=%d)", bid ?: @"?", getpid(), isApp);
+    NSString *pname = [[NSProcessInfo processInfo] processName];
+    BOOL isApp = [bid isEqualToString:WVP_APP_BID] || [pname isEqualToString:WVP_APP_BID];
+    BOOL isNet = WVPIsWebKitNet();
+    gIsApp = isApp;
+
+    WVPLog(@"=== 0.1.2 loaded into %@ (pid %d, app=%d, wknet=%d) ===",
+           bid ?: @"?", getpid(), isApp, isNet);
 
     if (isApp) {
-        gIsApp = YES;
-        WVPLog(@"App 进程已就绪, 等待 listen()");
-    } else {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            WVPLog(@"网络进程读到端口 %d", WVPActivePort());
-        });
+        WVPStartRelay();
+        WVPLog(@"App 进程就绪, 等待 listen()");
+    } else if (isNet) {
+        WVPLog(@"网络进程就绪, 代理 -> 127.0.0.1:%d, 白名单=%@",
+               WVP_RELAY_PORT, WVPDomains());
     }
 }
