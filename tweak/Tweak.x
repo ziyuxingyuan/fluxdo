@@ -1,4 +1,4 @@
-// WebViewProxy 0.1.4 - 让 FluxDo 的 WKWebView 走它自己的本地 DoH 代理
+// WebViewProxy 0.1.5 - 让 FluxDo 的 WKWebView 走它自己的本地 DoH 代理
 // 适用: Dopamine (rootless) iOS 15.0 - 16.6.1
 //
 // 0.1.4 相比 0.1.1 的改动:
@@ -42,6 +42,21 @@
 #define WVP_WK_BID      @"com.apple.WebKit.Networking"
 #define WVP_RELAY_PORT  65530
 #define WVP_MAX_HEAD    8192
+// 0.1.5: WebKit 网络进程的沙盒不允许写任何日志文件(fs_usage 实测: 注入后
+// 该进程只有一次 stat64, 没有任何 open/write), 所以诊断只能靠网络信标:
+// 每个被注入的进程在 loopback 上开一个只读 HTTP 端点, 用 SSH 探测即知
+// 是否注入、构造函数是否执行、hook 被调用了几次。
+//   App 进程      -> 65531
+//   WebKit 网络进程 -> 65532
+//   其它进程       -> 65533
+#define WVP_BEACON_APP    65531
+#define WVP_BEACON_WKNET  65532
+#define WVP_BEACON_OTHER  65533
+#define WVP_BEACON_SLOTS  4
+
+static volatile int gProxyCalls  = 0;  // CFNetworkCopySystemProxySettings 被调用次数
+static volatile int gProxyHit    = 0;  // 其中成功返回代理的次数
+static volatile int gProxyMiss   = 0;  // 其中判定不该接管(转发器不在/禁用)的次数
 
 extern CFDictionaryRef CFNetworkCopySystemProxySettings(void);
 
@@ -409,19 +424,81 @@ static BOOL WVPIsWebKitNet(void) {
     return gIsWKNet;
 }
 
+#pragma mark - 网络信标 (0.1.5 诊断用)
+
+static void *WVPBeaconClient(void *arg) {
+    int cfd = (int)(intptr_t)arg;
+    char req[512];
+    struct timeval tv; tv.tv_sec = 1; tv.tv_usec = 0;
+    setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    recv(cfd, req, sizeof(req) - 1, 0);
+
+    char body[512];
+    int blen = snprintf(body, sizeof(body),
+        "pid=%d app=%d wknet=%d proxyCalls=%d hit=%d miss=%d relay=%d domains=%lu\n",
+        getpid(), (int)gIsApp, (int)gIsWKNet,
+        gProxyCalls, gProxyHit, gProxyMiss,
+        WVP_RELAY_PORT, (unsigned long)WVPDomains().count);
+
+    char head[256];
+    int hlen = snprintf(head, sizeof(head),
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n"
+        "Connection: close\r\n\r\n", blen);
+    if (hlen > 0) send(cfd, head, (size_t)hlen, 0);
+    if (blen > 0) send(cfd, body, (size_t)blen, 0);
+    close(cfd);
+    return NULL;
+}
+
+static void *WVPBeaconAccept(void *arg) {
+    int lfd = (int)(intptr_t)arg;
+    for (;;) {
+        int cfd = accept(lfd, NULL, NULL);
+        if (cfd < 0) { usleep(50000); continue; }
+        pthread_t t;
+        if (pthread_create(&t, NULL, WVPBeaconClient, (void *)(intptr_t)cfd) == 0) pthread_detach(t);
+        else close(cfd);
+    }
+    return NULL;
+}
+
+static void WVPStartBeacon(int port) {
+    static int used[WVP_BEACON_SLOTS];
+    static int n = 0;
+    for (int i = 0; i < n; i++) if (used[i] == port) return;
+    if (n < WVP_BEACON_SLOTS) used[n++] = port;
+
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (lfd < 0) return;
+    int one = 1;
+    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) != 0) { close(lfd); return; }
+    if (listen(lfd, 16) != 0) { close(lfd); return; }
+    pthread_t t;
+    if (pthread_create(&t, NULL, WVPBeaconAccept, (void *)(intptr_t)lfd) == 0) pthread_detach(t);
+    else close(lfd);
+}
+
 #pragma mark - Hooks
 
 // 系统代理设置: iOS 上 CFNetwork 读取系统代理的唯一入口
 // (SCDynamicStoreCopyProxies 在 iOS SDK 里被标记为 unavailable, 不能用)
 %hookf(CFDictionaryRef, CFNetworkCopySystemProxySettings) {
     if (WVPIsWebKitNet()) {
+        gProxyCalls++;
         NSDictionary *p = WVPProxyDict();
         if (p) {
+            gProxyHit++;
             static time_t lastLog = 0;
             time_t now = time(NULL);
             if (now - lastLog > 10) { lastLog = now; WVPLog(@"CFNetwork 取代理 -> %d", WVP_RELAY_PORT); }
             return (CFDictionaryRef)CFBridgingRetain(p);
         }
+        gProxyMiss++;
     }
     return %orig;
 }
@@ -494,8 +571,11 @@ static BOOL WVPIsWebKitNet(void) {
     BOOL isNet = WVPIsWebKitNet();
     gIsApp = isApp;
 
-    WVPLog(@"=== 0.1.4 loaded into %@ (pid %d, app=%d, wknet=%d) ===",
+    WVPLog(@"=== 0.1.5 loaded into %@ (pid %d, app=%d, wknet=%d) ===",
            bid ?: @"?", getpid(), isApp, isNet);
+
+    // 信标先起, 哪怕后面全部失败也能被 SSH 看到
+    WVPStartBeacon(isApp ? WVP_BEACON_APP : (isNet ? WVP_BEACON_WKNET : WVP_BEACON_OTHER));
 
     if (isApp) {
         WVPStartRelay();
