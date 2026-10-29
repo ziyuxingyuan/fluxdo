@@ -7,9 +7,13 @@ on:
       - 'tweak/**'
       - '.github/workflows/build-tweak.yml'
 
+concurrency:
+  group: build-tweak-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
 
