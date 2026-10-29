@@ -27,26 +27,61 @@
 #define WVP_LOG_PATH @"/var/mobile/Library/Logs/WebViewProxy.log"
 #define WVP_APP_BID  @"com.github.lingyan000.fluxdo"
 
+// 日志: 依次尝试多个位置, 哪个真能写就用哪个
+//   1) 进程容器内的 tmp/      (沙盒内必定可写)
+//   2) /var/mobile/Library/Logs/  (越权运行的进程)
+//   3) /tmp/
+static NSString *WVPWriteLine(NSString *path, NSString *line) {
+    NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *dir = [path stringByDeletingLastPathComponent];
+    if (![fm fileExistsAtPath:dir])
+        [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    if (![fm fileExistsAtPath:path])
+        [fm createFileAtPath:path contents:nil attributes:nil];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (!fh) return nil;                    // 沙盒拒绝打开 -> 换下一个候选
+    @try {
+        [fh seekToEndOfFile];
+        [fh writeData:data];
+        [fh closeFile];
+        return path;
+    } @catch (NSException *e) {
+        @try { [fh closeFile]; } @catch (NSException *e2) {}
+        return nil;
+    }
+}
+
 static void WVPLog(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
-    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], msg];
-    NSLog(@"[WebViewProxy] %@", msg);
-    @try {
-        NSFileManager *fm = [NSFileManager defaultManager];
-        NSString *dir = [WVP_LOG_PATH stringByDeletingLastPathComponent];
-        if (![fm fileExistsAtPath:dir])
-            [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-        if (![fm fileExistsAtPath:WVP_LOG_PATH]) {
-            [line writeToFile:WVP_LOG_PATH atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        } else {
-            NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:WVP_LOG_PATH];
-            [fh seekToEndOfFile];
-            [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
-            [fh closeFile];
+    NSLog(@"[WebViewProxy] %@", msg);       // 系统日志兜底, 不受沙盒限制
+
+    static NSArray *cands = nil;
+    static NSUInteger idx = 0;
+    static BOOL announced = NO;
+    if (!cands) {
+        NSMutableArray *a = [NSMutableArray array];
+        NSString *tmp = NSTemporaryDirectory();
+        if (tmp.length) [a addObject:[tmp stringByAppendingPathComponent:@"WebViewProxy.log"]];
+        [a addObject:@"/var/mobile/Library/Logs/WebViewProxy.log"];
+        [a addObject:@"/tmp/WebViewProxy.log"];
+        cands = [a copy];
+    }
+    NSString *stamp = [NSString stringWithFormat:@"[%@] [pid %d] ", [NSDate date], getpid()];
+    while (idx < cands.count) {
+        NSString *path = cands[idx];
+        if (WVPWriteLine(path, [stamp stringByAppendingFormat:@"%@\n", msg])) {
+            if (!announced) {
+                announced = YES;
+                WVPWriteLine(path, [stamp stringByAppendingFormat:@"日志落盘于 %@ (候选 %lu 个)\n",
+                                    path, (unsigned long)cands.count]);
+            }
+            return;
         }
-    } @catch (NSException *e) { }
+        idx++;
+    }
 }
 
 static id WVPGet(NSString *key) {
