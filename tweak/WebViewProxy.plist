@@ -7,6 +7,9 @@
     <key>Bundles</key>
     <array>
       <string>com.github.lingyan000.fluxdo</string>
+    </array>
+    <key>Executables</key>
+    <array>
       <string>com.apple.WebKit.Networking</string>
     </array>
   </dict>
