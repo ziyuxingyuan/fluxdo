@@ -1,4 +1,4 @@
-// WebViewProxy 0.1.5 - 让 FluxDo 的 WKWebView 走它自己的本地 DoH 代理
+// WebViewProxy 0.1.6 - 让 FluxDo 的 WKWebView 走它自己的本地 DoH 代理
 // 适用: Dopamine (rootless) iOS 15.0 - 16.6.1
 //
 // 0.1.4 相比 0.1.1 的改动:
@@ -57,6 +57,11 @@
 static volatile int gProxyCalls  = 0;  // CFNetworkCopySystemProxySettings 被调用次数
 static volatile int gProxyHit    = 0;  // 其中成功返回代理的次数
 static volatile int gProxyMiss   = 0;  // 其中判定不该接管(转发器不在/禁用)的次数
+static volatile int gRelayConns  = 0;  // 转发器 accept 到的连接总数
+static volatile int gPumpUp      = 0;  // 客户端 -> 上游 的字节数
+static volatile int gPumpDown    = 0;  // 上游 -> 客户端 的字节数
+static volatile int gLastHostLen = 0;  // 最近一次请求头的长度(粗略显示有无流量)
+static char         gLastReq[128] = {0}; // 最近一次请求的首行(CONNECT 目标/路径)
 
 extern CFDictionaryRef CFNetworkCopySystemProxySettings(void);
 
@@ -210,11 +215,12 @@ static int WVPConnectHost(NSString *host, int port, int timeoutMs) {
     return fd;
 }
 
-static void WVPPump(int from, int to) {
+static void WVPPumpDir(int from, int to, int dir) {
     char buf[16384];
     for (;;) {
         ssize_t n = recv(from, buf, sizeof(buf), 0);
         if (n <= 0) break;
+        if (dir > 0) gPumpUp += (int)n; else gPumpDown += (int)n;
         ssize_t off = 0;
         while (off < n) {
             ssize_t w = send(to, buf + off, (size_t)(n - off), 0);
@@ -225,11 +231,13 @@ static void WVPPump(int from, int to) {
     shutdown(to, SHUT_WR);
 }
 
-typedef struct { int a; int b; } WVPPumpArgs;
+static void WVPPump(int from, int to) { WVPPumpDir(from, to, 0); }
+
+typedef struct { int a; int b; int dir; } WVPPumpArgs;
 
 static void *WVPPumpThread(void *arg) {
     WVPPumpArgs *p = (WVPPumpArgs *)arg;
-    WVPPump(p->a, p->b);
+    WVPPumpDir(p->a, p->b, p->dir);
     free(p);
     return NULL;
 }
@@ -257,6 +265,9 @@ static void *WVPClientThread(void *arg) {
 
     char method[16] = {0}, target[1024] = {0};
     if (sscanf(head, "%15s %1023s", method, target) != 2) { close(cfd); return NULL; }
+
+    gLastHostLen = (int)hlen;
+    snprintf(gLastReq, sizeof(gLastReq), "%s %s", method, target);
 
     BOOL isConnect = (strcmp(method, "CONNECT") == 0);
     NSString *host = nil;
@@ -325,6 +336,7 @@ static void *WVPClientThread(void *arg) {
     WVPPumpArgs *args = malloc(sizeof(WVPPumpArgs));
     args->a = upfd;
     args->b = cfd;
+    args->dir = -1;
     pthread_t t;
     if (pthread_create(&t, NULL, WVPPumpThread, args) == 0) pthread_detach(t);
     else free(args);
@@ -339,6 +351,7 @@ static void *WVPAcceptLoop(void *arg) {
     for (;;) {
         int cfd = accept(lfd, NULL, NULL);
         if (cfd < 0) { usleep(20000); continue; }
+        gRelayConns++;
         int one = 1;
         setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
         pthread_t t;
@@ -433,12 +446,19 @@ static void *WVPBeaconClient(void *arg) {
     setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     recv(cfd, req, sizeof(req) - 1, 0);
 
-    char body[512];
+    char body[1024];
     int blen = snprintf(body, sizeof(body),
-        "pid=%d app=%d wknet=%d proxyCalls=%d hit=%d miss=%d relay=%d domains=%lu\n",
+        "ver=0.1.6 pid=%d app=%d wknet=%d\n"
+        "proxyCalls=%d hit=%d miss=%d\n"
+        "relayPort=%d relayConns=%d up=%d down=%d\n"
+        "activePort=%d domains=%lu global=%d enabled=%d\n"
+        "lastHeadLen=%d lastReq=[%s]\n",
         getpid(), (int)gIsApp, (int)gIsWKNet,
         gProxyCalls, gProxyHit, gProxyMiss,
-        WVP_RELAY_PORT, (unsigned long)WVPDomains().count);
+        WVP_RELAY_PORT, gRelayConns, gPumpUp, gPumpDown,
+        WVPActivePort(), (unsigned long)WVPDomains().count,
+        (int)WVPGlobalMode(), (int)WVPEnabled(),
+        gLastHostLen, gLastReq);
 
     char head[256];
     int hlen = snprintf(head, sizeof(head),
@@ -571,7 +591,7 @@ static void WVPStartBeacon(int port) {
     BOOL isNet = WVPIsWebKitNet();
     gIsApp = isApp;
 
-    WVPLog(@"=== 0.1.5 loaded into %@ (pid %d, app=%d, wknet=%d) ===",
+    WVPLog(@"=== 0.1.6 loaded into %@ (pid %d, app=%d, wknet=%d) ===",
            bid ?: @"?", getpid(), isApp, isNet);
 
     // 信标先起, 哪怕后面全部失败也能被 SSH 看到
