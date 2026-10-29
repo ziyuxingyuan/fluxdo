@@ -64,6 +64,16 @@ static volatile int gCallsAutoCfg = 0;  // CFNetworkCopyProxiesForAutoConfigurat
 static volatile int gRelayConns  = 0;  // 转发器 accept 到的连接总数
 static volatile int gPumpUp      = 0;  // 客户端 -> 上游 的字节数
 static volatile int gPumpDown    = 0;  // 上游 -> 客户端 的字节数
+#ifndef SOL_LOCAL
+#define SOL_LOCAL 0
+#endif
+#ifndef LOCAL_PEERPID
+#define LOCAL_PEERPID 0x002
+#endif
+
+static volatile int gLastPeerPid  = 0;  // 最近一条连到转发器的连接来自哪个 pid
+static volatile int gPeerPidPrev  = 0;  // 上一条
+static volatile int gPeerPidPrev2 = 0;  // 上上条
 static volatile int gLastHostLen = 0;  // 最近一次请求头的长度(粗略显示有无流量)
 static char         gLastReq[128] = {0}; // 最近一次请求的首行(CONNECT 目标/路径)
 
@@ -252,6 +262,15 @@ static void *WVPPumpThread(void *arg) {
 
 static void *WVPClientThread(void *arg) {
     int cfd = (int)(intptr_t)arg;
+
+    {
+        int peer = 0; socklen_t plen = sizeof(peer);
+        if (getsockopt(cfd, SOL_LOCAL, LOCAL_PEERPID, &peer, &plen) == 0 && peer > 0) {
+            gPeerPidPrev2 = gPeerPidPrev;
+            gPeerPidPrev  = gLastPeerPid;
+            gLastPeerPid  = peer;
+        }
+    }
 
     struct timeval tv; tv.tv_sec = 3; tv.tv_usec = 0;
     setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -487,19 +506,21 @@ static void *WVPBeaconClient(void *arg) {
 
     char body[1024];
     int blen = snprintf(body, sizeof(body),
-        "ver=0.1.7 pid=%d app=%d wknet=%d\n"
+        "ver=0.1.8 pid=%d app=%d wknet=%d\n"
         "sysCalls=%d sysHit=%d sysMiss=%d\n"
         "forURLCalls=%d forURLHit=%d autoCfgCalls=%d\n"
         "relayPort=%d relayConns=%d up=%d down=%d\n"
         "activePort=%d domains=%lu global=%d enabled=%d\n"
-        "lastHeadLen=%d lastReq=[%s]\n",
+        "lastHeadLen=%d lastReq=[%s]\n"
+        "peerPid=%d peerPrev=%d peerPrev2=%d\n",
         getpid(), (int)gIsApp, (int)gIsWKNet,
         gProxyCalls, gProxyHit, gProxyMiss,
         gCallsForURL, gHitForURL, gCallsAutoCfg,
         WVP_RELAY_PORT, gRelayConns, gPumpUp, gPumpDown,
         WVPActivePort(), (unsigned long)WVPDomains().count,
         (int)WVPGlobalMode(), (int)WVPEnabled(),
-        gLastHostLen, gLastReq);
+        gLastHostLen, gLastReq,
+        gLastPeerPid, gPeerPidPrev, gPeerPidPrev2);
 
     char head[256];
     int hlen = snprintf(head, sizeof(head),
