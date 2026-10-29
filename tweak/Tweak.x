@@ -1,4 +1,4 @@
-// WebViewProxy 0.1.6 - 让 FluxDo 的 WKWebView 走它自己的本地 DoH 代理
+// WebViewProxy 0.1.7 - 让 FluxDo 的 WKWebView 走它自己的本地 DoH 代理
 // 适用: Dopamine (rootless) iOS 15.0 - 16.6.1
 //
 // 0.1.4 相比 0.1.1 的改动:
@@ -22,6 +22,7 @@
 #import <UIKit/UIKit.h>
 #import <WebKit/WebKit.h>
 #import <SystemConfiguration/SystemConfiguration.h>
+#import <CFNetwork/CFProxySupport.h>
 #import <netinet/in.h>
 #import <netinet/tcp.h>
 #import <netdb.h>
@@ -57,6 +58,9 @@
 static volatile int gProxyCalls  = 0;  // CFNetworkCopySystemProxySettings 被调用次数
 static volatile int gProxyHit    = 0;  // 其中成功返回代理的次数
 static volatile int gProxyMiss   = 0;  // 其中判定不该接管(转发器不在/禁用)的次数
+static volatile int gCallsForURL  = 0;  // CFNetworkCopyProxiesForURL 调用次数
+static volatile int gHitForURL    = 0;  // 其中我们返回了代理
+static volatile int gCallsAutoCfg = 0;  // CFNetworkCopyProxiesForAutoConfigurationScript
 static volatile int gRelayConns  = 0;  // 转发器 accept 到的连接总数
 static volatile int gPumpUp      = 0;  // 客户端 -> 上游 的字节数
 static volatile int gPumpDown    = 0;  // 上游 -> 客户端 的字节数
@@ -64,6 +68,8 @@ static volatile int gLastHostLen = 0;  // 最近一次请求头的长度(粗略�
 static char         gLastReq[128] = {0}; // 最近一次请求的首行(CONNECT 目标/路径)
 
 extern CFDictionaryRef CFNetworkCopySystemProxySettings(void);
+extern CFArrayRef CFNetworkCopyProxiesForURL(CFURLRef url, CFDictionaryRef proxySettings);
+extern CFArrayRef CFNetworkCopyProxiesForAutoConfigurationScript(CFStringRef script, CFURLRef targetURL, CFErrorRef *error);
 
 #pragma mark - 日志
 
@@ -422,6 +428,39 @@ static NSDictionary *WVPProxyDict(void) {
     return cache;
 }
 
+#pragma mark - 代理数组 (CFNetworkCopyProxiesForURL 返回值)
+
+// CFNetworkCopyProxiesForURL 要的是「代理数组」, 每个元素是一个字典:
+//   kCFProxyTypeKey  = kCFProxyTypeHTTP / kCFProxyTypeHTTPS
+//   kCFProxyHostNameKey / kCFProxyPortNumberKey
+// 与系统代理设置用的是完全不同的键, 不能复用 WVPProxyDict。
+// 另外必须保留一个 kCFProxyTypeNone 兜底项, 否则 CFNetwork 认为无可用代理。
+static CFArrayRef WVPProxyArray(void) {
+    if (!WVPEnabled()) return NULL;
+    if (!WVPPortAlive(WVP_RELAY_PORT)) return NULL;
+
+    CFStringRef host = CFSTR("127.0.0.1");
+    int port = WVP_RELAY_PORT;
+
+    CFMutableArrayRef arr = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
+    if (!arr) return NULL;
+
+    const void *types[2] = { kCFProxyTypeHTTP, kCFProxyTypeHTTPS };
+    for (int i = 0; i < 2; i++) {
+        CFMutableDictionaryRef d = CFDictionaryCreateMutable(kCFAllocatorDefault, 0,
+            &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        if (!d) continue;
+        CFNumberRef pn = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &port);
+        CFDictionarySetValue(d, kCFProxyTypeKey, types[i]);
+        CFDictionarySetValue(d, kCFProxyHostNameKey, host);
+        CFDictionarySetValue(d, kCFProxyPortNumberKey, pn);
+        if (pn) CFRelease(pn);
+        CFArrayAppendValue(arr, d);
+        CFRelease(d);
+    }
+    return arr;
+}
+
 #pragma mark - 进程识别
 
 static BOOL gIsApp = NO;
@@ -448,13 +487,15 @@ static void *WVPBeaconClient(void *arg) {
 
     char body[1024];
     int blen = snprintf(body, sizeof(body),
-        "ver=0.1.6 pid=%d app=%d wknet=%d\n"
-        "proxyCalls=%d hit=%d miss=%d\n"
+        "ver=0.1.7 pid=%d app=%d wknet=%d\n"
+        "sysCalls=%d sysHit=%d sysMiss=%d\n"
+        "forURLCalls=%d forURLHit=%d autoCfgCalls=%d\n"
         "relayPort=%d relayConns=%d up=%d down=%d\n"
         "activePort=%d domains=%lu global=%d enabled=%d\n"
         "lastHeadLen=%d lastReq=[%s]\n",
         getpid(), (int)gIsApp, (int)gIsWKNet,
         gProxyCalls, gProxyHit, gProxyMiss,
+        gCallsForURL, gHitForURL, gCallsAutoCfg,
         WVP_RELAY_PORT, gRelayConns, gPumpUp, gPumpDown,
         WVPActivePort(), (unsigned long)WVPDomains().count,
         (int)WVPGlobalMode(), (int)WVPEnabled(),
@@ -511,15 +552,32 @@ static void WVPStartBeacon(int port) {
     if (WVPIsWebKitNet()) {
         gProxyCalls++;
         NSDictionary *p = WVPProxyDict();
-        if (p) {
-            gProxyHit++;
-            static time_t lastLog = 0;
-            time_t now = time(NULL);
-            if (now - lastLog > 10) { lastLog = now; WVPLog(@"CFNetwork 取代理 -> %d", WVP_RELAY_PORT); }
-            return (CFDictionaryRef)CFBridgingRetain(p);
-        }
+        if (p) { gProxyHit++; return (CFDictionaryRef)CFBridgingRetain(p); }
         gProxyMiss++;
     }
+    return %orig;
+}
+
+// WebKit 真正的入口: CFNetwork 在发请求前用这个函数把「URL -> 代理列表」算出来。
+// 只要在这里返回我们的转发器, WKWebView 的所有请求就会走 127.0.0.1:65530。
+%hookf(CFArrayRef, CFNetworkCopyProxiesForURL, CFURLRef url, CFDictionaryRef proxySettings) {
+    if (WVPIsWebKitNet()) {
+        gCallsForURL++;
+        NSString *host = nil;
+        if (url) {
+            CFStringRef h = CFURLCopyHostName(url);
+            if (h) { host = (__bridge_transfer NSString *)h; }
+        }
+        if (host && !WVPShouldProxyHost(host)) return %orig;
+        CFArrayRef arr = WVPProxyArray();
+        if (arr) { gHitForURL++; return arr; }
+    }
+    return %orig;
+}
+
+// PAC 脚本路径: 仅计数, 不改行为。
+%hookf(CFArrayRef, CFNetworkCopyProxiesForAutoConfigurationScript, CFStringRef script, CFURLRef targetURL, CFErrorRef *error) {
+    if (WVPIsWebKitNet()) gCallsAutoCfg++;
     return %orig;
 }
 
@@ -591,7 +649,7 @@ static void WVPStartBeacon(int port) {
     BOOL isNet = WVPIsWebKitNet();
     gIsApp = isApp;
 
-    WVPLog(@"=== 0.1.6 loaded into %@ (pid %d, app=%d, wknet=%d) ===",
+    WVPLog(@"=== 0.1.7 loaded into %@ (pid %d, app=%d, wknet=%d) ===",
            bid ?: @"?", getpid(), isApp, isNet);
 
     // 信标先起, 哪怕后面全部失败也能被 SSH 看到
