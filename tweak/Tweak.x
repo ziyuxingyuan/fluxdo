@@ -1,7 +1,7 @@
-// WebViewProxy 0.1.3 - 让 FluxDo 的 WKWebView 走它自己的本地 DoH 代理
+// WebViewProxy 0.1.4 - 让 FluxDo 的 WKWebView 走它自己的本地 DoH 代理
 // 适用: Dopamine (rootless) iOS 15.0 - 16.6.1
 //
-// 0.1.3 相比 0.1.1 的改动:
+// 0.1.4 相比 0.1.1 的改动:
 //   1) filter plist 改用 Executables 匹配 com.apple.WebKit.Networking
 //      (XPC 服务不走 Bundles 匹配, 之前从未注入成功)
 //   2) 放弃 NSURLSessionConfiguration.connectionProxyDictionary,
@@ -121,11 +121,6 @@ static int WVPActivePort(void) {
     int p = [WVPGet(@"Port") intValue];
     if (p > 0 && p < 65536) return p;
     return [WVPGet(@"DetectedPort") intValue];
-}
-
-static NSString *WVPProxyHost(void) {
-    NSString *h = WVPGet(@"Host");
-    return h.length ? h : @"127.0.0.1";
 }
 
 static BOOL WVPGlobalMode(void) {
@@ -499,7 +494,7 @@ static BOOL WVPIsWebKitNet(void) {
     BOOL isNet = WVPIsWebKitNet();
     gIsApp = isApp;
 
-    WVPLog(@"=== 0.1.3 loaded into %@ (pid %d, app=%d, wknet=%d) ===",
+    WVPLog(@"=== 0.1.4 loaded into %@ (pid %d, app=%d, wknet=%d) ===",
            bid ?: @"?", getpid(), isApp, isNet);
 
     if (isApp) {
