@@ -1,4 +1,4 @@
-// WebViewProxy 0.1.7 - 让 FluxDo 的 WKWebView 走它自己的本地 DoH 代理
+// WebViewProxy 0.1.9 - 让 FluxDo 的 WKWebView 走它自己的本地 DoH 代理
 // 适用: Dopamine (rootless) iOS 15.0 - 16.6.1
 //
 // 0.1.4 相比 0.1.1 的改动:
@@ -61,6 +61,15 @@ static volatile int gProxyMiss   = 0;  // 其中判定不该接管(转发器不�
 static volatile int gCallsForURL  = 0;  // CFNetworkCopyProxiesForURL 调用次数
 static volatile int gHitForURL    = 0;  // 其中我们返回了代理
 static volatile int gCallsAutoCfg = 0;  // CFNetworkCopyProxiesForAutoConfigurationScript
+// 0.1.9: 关键怀疑 —— wknet 走 NSURLSessionConfiguration.connectionProxyDictionary,
+// 根本不经过 CFNetworkCopy* 三个函数, 所以那三个计数永远是 0。
+// 这里给 NSURLSessionConfiguration 三个方法加计数, 再 hook connect() 直接数
+// "本进程有没有连过 127.0.0.1:65530", 一次就能定性。
+static volatile int gNsCfgGet      = 0;  // -connectionProxyDictionary 被读次数
+static volatile int gNsCfgDefault  = 0;  // +defaultSessionConfiguration 被调次数
+static volatile int gNsCfgEphemeral= 0;  // +ephemeralSessionConfiguration 被调次数
+static volatile int gConnRelay     = 0;  // connect() 到 127.0.0.1:65530 的次数
+static volatile int gConnTotal     = 0;  // connect() 总次数(本进程)
 static volatile int gRelayConns  = 0;  // 转发器 accept 到的连接总数
 static volatile int gPumpUp      = 0;  // 客户端 -> 上游 的字节数
 static volatile int gPumpDown    = 0;  // 上游 -> 客户端 的字节数
@@ -506,13 +515,14 @@ static void *WVPBeaconClient(void *arg) {
 
     char body[1024];
     int blen = snprintf(body, sizeof(body),
-        "ver=0.1.8 pid=%d app=%d wknet=%d\n"
+        "ver=0.1.9 pid=%d app=%d wknet=%d\n"
         "sysCalls=%d sysHit=%d sysMiss=%d\n"
         "forURLCalls=%d forURLHit=%d autoCfgCalls=%d\n"
         "relayPort=%d relayConns=%d up=%d down=%d\n"
         "activePort=%d domains=%lu global=%d enabled=%d\n"
         "lastHeadLen=%d lastReq=[%s]\n"
-        "peerPid=%d peerPrev=%d peerPrev2=%d\n",
+        "peerPid=%d peerPrev=%d peerPrev2=%d\n"
+        "nsCfgGet=%d nsCfgDef=%d nsCfgEph=%d connRelay=%d connTotal=%d\n",
         getpid(), (int)gIsApp, (int)gIsWKNet,
         gProxyCalls, gProxyHit, gProxyMiss,
         gCallsForURL, gHitForURL, gCallsAutoCfg,
@@ -520,7 +530,8 @@ static void *WVPBeaconClient(void *arg) {
         WVPActivePort(), (unsigned long)WVPDomains().count,
         (int)WVPGlobalMode(), (int)WVPEnabled(),
         gLastHostLen, gLastReq,
-        gLastPeerPid, gPeerPidPrev, gPeerPidPrev2);
+        gLastPeerPid, gPeerPidPrev, gPeerPidPrev2,
+        gNsCfgGet, gNsCfgDefault, gNsCfgEphemeral, gConnRelay, gConnTotal);
 
     char head[256];
     int hlen = snprintf(head, sizeof(head),
@@ -602,6 +613,20 @@ static void WVPStartBeacon(int port) {
     return %orig;
 }
 
+// 0.1.9: 直接数 connect()。本进程只要连过 127.0.0.1:65530,
+// 就证明是它把流量送进了转发器 —— 无论经过哪个 API。
+%hookf(int, connect, int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+    if (addr && addr->sa_family == AF_INET) {
+        const struct sockaddr_in *a4 = (const struct sockaddr_in *)addr;
+        gConnTotal++;
+        if (ntohs(a4->sin_port) == WVP_RELAY_PORT &&
+            ntohl(a4->sin_addr.s_addr) == INADDR_LOOPBACK) {
+            gConnRelay++;
+        }
+    }
+    return %orig;
+}
+
 // FluxDo 进程: 本地代理 listen() 时抓到端口
 %hookf(int, listen, int sockfd, int backlog) {
     int r = %orig;
@@ -628,6 +653,7 @@ static void WVPStartBeacon(int port) {
 
 - (NSDictionary *)connectionProxyDictionary {
     if (WVPIsWebKitNet()) {
+        gNsCfgGet++;
         NSDictionary *p = WVPProxyDict();
         if (p) return p;
     }
@@ -637,6 +663,7 @@ static void WVPStartBeacon(int port) {
 + (NSURLSessionConfiguration *)defaultSessionConfiguration {
     NSURLSessionConfiguration *c = %orig();
     if (WVPIsWebKitNet()) {
+        gNsCfgDefault++;
         NSDictionary *p = WVPProxyDict();
         if (p) c.connectionProxyDictionary = p;
     }
@@ -646,6 +673,7 @@ static void WVPStartBeacon(int port) {
 + (NSURLSessionConfiguration *)ephemeralSessionConfiguration {
     NSURLSessionConfiguration *c = %orig();
     if (WVPIsWebKitNet()) {
+        gNsCfgEphemeral++;
         NSDictionary *p = WVPProxyDict();
         if (p) c.connectionProxyDictionary = p;
     }
@@ -670,7 +698,7 @@ static void WVPStartBeacon(int port) {
     BOOL isNet = WVPIsWebKitNet();
     gIsApp = isApp;
 
-    WVPLog(@"=== 0.1.7 loaded into %@ (pid %d, app=%d, wknet=%d) ===",
+    WVPLog(@"=== 0.1.9 loaded into %@ (pid %d, app=%d, wknet=%d) ===",
            bid ?: @"?", getpid(), isApp, isNet);
 
     // 信标先起, 哪怕后面全部失败也能被 SSH 看到
