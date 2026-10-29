@@ -1,4 +1,4 @@
-// WebViewProxy 0.1.9 - 让 FluxDo 的 WKWebView 走它自己的本地 DoH 代理
+// WebViewProxy 0.1.10 - 让 FluxDo 的 WKWebView 走它自己的本地 DoH 代理
 // 适用: Dopamine (rootless) iOS 15.0 - 16.6.1
 //
 // 0.1.4 相比 0.1.1 的改动:
@@ -54,6 +54,11 @@
 #define WVP_BEACON_WKNET  65532
 #define WVP_BEACON_OTHER  65533
 #define WVP_BEACON_SLOTS  4
+// 0.1.10: 日志上限保护。日志是纯诊断用途, 只追加不轮转会无限增长。
+// 超过 256KB 时裁掉旧内容, 只保留最近 128KB(从整行边界开始),
+// 并在文件头写一行说明。写入只发生在 App 进程, 频率极低(实测 5 小时 8KB)。
+#define WVP_LOG_MAX_BYTES  (256 * 1024)
+#define WVP_LOG_KEEP_BYTES (128 * 1024)
 
 static volatile int gProxyCalls  = 0;  // CFNetworkCopySystemProxySettings 被调用次数
 static volatile int gProxyHit    = 0;  // 其中成功返回代理的次数
@@ -92,6 +97,35 @@ extern CFArrayRef CFNetworkCopyProxiesForAutoConfigurationScript(CFStringRef scr
 
 #pragma mark - 日志
 
+// 文件超过上限就裁到最近 WVP_LOG_KEEP_BYTES, 从下一个换行开始, 不留半行。
+static void WVPRotateIfNeeded(NSString *path) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSDictionary *attr = [fm attributesOfItemAtPath:path error:nil];
+    if (!attr) return;
+    unsigned long long sz = [[attr objectForKey:NSFileSize] unsignedLongLongValue];
+    if (sz <= WVP_LOG_MAX_BYTES) return;
+
+    NSData *old = [NSData dataWithContentsOfFile:path];
+    if (!old) return;
+    if (old.length <= WVP_LOG_KEEP_BYTES) {
+        [fm createFileAtPath:path contents:nil attributes:nil];
+        return;
+    }
+    NSData *tail = [old subdataWithRange:NSMakeRange(old.length - WVP_LOG_KEEP_BYTES, WVP_LOG_KEEP_BYTES)];
+    const char *p = (const char *)tail.bytes;
+    NSUInteger off = 0;
+    while (off < tail.length && p[off] != '\n') off++;
+    if (off < tail.length) off++;
+
+    NSMutableData *nd = [NSMutableData data];
+    NSString *hdr = [NSString stringWithFormat:
+        @"[%@] [pid %d] 日志超过 %dKB, 已裁掉旧内容, 保留最近 %dKB\n",
+        [NSDate date], getpid(), (int)(WVP_LOG_MAX_BYTES / 1024), (int)(WVP_LOG_KEEP_BYTES / 1024)];
+    [nd appendData:[hdr dataUsingEncoding:NSUTF8StringEncoding]];
+    if (off < tail.length) [nd appendData:[tail subdataWithRange:NSMakeRange(off, tail.length - off)]];
+    [nd writeToFile:path atomically:YES];
+}
+
 static NSString *WVPWriteLine(NSString *path, NSString *line) {
     NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -100,6 +134,7 @@ static NSString *WVPWriteLine(NSString *path, NSString *line) {
         [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
     if (![fm fileExistsAtPath:path])
         [fm createFileAtPath:path contents:nil attributes:nil];
+    WVPRotateIfNeeded(path);
     NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
     if (!fh) return nil;
     @try {
@@ -515,7 +550,7 @@ static void *WVPBeaconClient(void *arg) {
 
     char body[1024];
     int blen = snprintf(body, sizeof(body),
-        "ver=0.1.9 pid=%d app=%d wknet=%d\n"
+        "ver=0.1.10 pid=%d app=%d wknet=%d\n"
         "sysCalls=%d sysHit=%d sysMiss=%d\n"
         "forURLCalls=%d forURLHit=%d autoCfgCalls=%d\n"
         "relayPort=%d relayConns=%d up=%d down=%d\n"
@@ -698,7 +733,7 @@ static void WVPStartBeacon(int port) {
     BOOL isNet = WVPIsWebKitNet();
     gIsApp = isApp;
 
-    WVPLog(@"=== 0.1.9 loaded into %@ (pid %d, app=%d, wknet=%d) ===",
+    WVPLog(@"=== 0.1.10 loaded into %@ (pid %d, app=%d, wknet=%d) ===",
            bid ?: @"?", getpid(), isApp, isNet);
 
     // 信标先起, 哪怕后面全部失败也能被 SSH 看到
