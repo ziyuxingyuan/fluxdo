@@ -46,6 +46,8 @@
 #import <stdio.h>
 #import <stdlib.h>
 #import <string.h>
+#import <dlfcn.h>
+#import <sys/sysctl.h>
 
 #define WVP_DOMAIN      CFSTR("com.fluxdo.webviewproxy")
 #define WVP_APP_BID     @"com.github.lingyan000.fluxdo"
