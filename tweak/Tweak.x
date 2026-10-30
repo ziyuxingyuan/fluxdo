@@ -1,4 +1,13 @@
-// WebViewProxy 0.1.11 - 让 FluxDo 的 WKWebView 走它自己的本地 DoH 代理
+// WebViewProxy 0.1.12 - 让 FluxDo 的 WKWebView 走它自己的本地 DoH 代理
+//
+// 0.1.12 (关键修复): 加进程归属判定
+//   com.apple.WebKit.Networking 是所有 App 共用的系统网络进程族。
+//   0.1.11 只按进程名判断, 于是给设备上每一个 WebView 都塞了
+//   HTTPProxy=127.0.0.1:65530。FluxDo 一旦被 iOS 挂起, 65530 变成
+//   「能连但不回话」的黑洞, 其它 App 的网页全部卡死 —— 即
+//   「开着 VPN 用过一次 FluxDo, 整机断网」。
+//   现在用 responsibility 私有 API 问内核「我是替谁干活」,
+//   只有责任进程是 FluxDo 时才接管。
 // 适用: Dopamine (rootless) iOS 15.0 - 16.6.1
 //
 // 0.1.4 相比 0.1.1 的改动:
@@ -545,6 +554,110 @@ static BOOL WVPIsWebKitNet(void) {
     return gIsWKNet;
 }
 
+#pragma mark - 进程归属判定 (0.1.12)
+
+// 用 responsibility 私有 API 问内核 "我是替哪个进程干活"。
+// com.apple.WebKit.Networking 是系统共享的, 光看进程名无法区分 Safari 与 FluxDo。
+static volatile int  gRespPid     = 0;    // 责任进程 pid, 0=还没查到
+static volatile int  gEligible    = -1;   // -1 未判定, 0 不接管, 1 接管
+static volatile int  gRespFnFound = 0;    // responsibility 符号是否存在
+static volatile int  gPathSrc     = 0;    // 路径来源: 1=proc_pidpath 2=sysctl 0=失败
+static volatile int  gRespTries   = 0;    // 查了几次
+static char          gRespPath[256] = {0};
+
+typedef pid_t (*WVPRespFn)(pid_t);
+typedef int   (*WVPProcPathFn)(int, char *, unsigned int);
+
+static void WVPGetProcPath(int pid, char *out, size_t outlen) {
+    if (!out || outlen < 2) return;
+    out[0] = 0;
+    static WVPProcPathFn pf = NULL;
+    static BOOL looked = NO;
+    if (!looked) {
+        looked = YES;
+        void *lh = dlopen("/usr/lib/libproc.dylib", RTLD_LAZY);
+        if (lh) pf = (WVPProcPathFn)dlsym(lh, "proc_pidpath");
+        if (!pf) pf = (WVPProcPathFn)dlsym(RTLD_DEFAULT, "proc_pidpath");
+    }
+    if (pf && pf(pid, out, (unsigned int)outlen) > 0 && out[0]) {
+        gPathSrc = 1;
+        return;
+    }
+    // 兜底: sysctl KERN_PROCARGS2, 结构是 [int argc][可执行路径\0]...
+    int mib[3] = { CTL_KERN, KERN_PROCARGS2, pid };
+    size_t size = 4096;
+    char *buf = (char *)malloc(size);
+    if (!buf) return;
+    if (sysctl(mib, 3, buf, &size, NULL, 0) == 0 && size > sizeof(int)) {
+        const char *p = buf + sizeof(int);
+        const char *end = buf + size;
+        const char *q = p;
+        while (q < end && *q) q++;
+        size_t n = (size_t)(q - p);
+        if (n > 0 && n < outlen) {
+            memcpy(out, p, n);
+            out[n] = 0;
+            gPathSrc = 2;
+        }
+    }
+    free(buf);
+}
+
+static void WVPResolveResponsible(void) {
+    if (gRespPid > 0) return;
+    static WVPRespFn rfn = NULL;
+    static BOOL looked = NO;
+    if (!looked) {
+        looked = YES;
+        rfn = (WVPRespFn)dlsym(RTLD_DEFAULT, "responsibility_get_pid_responsible_for_pid");
+        if (!rfn) {
+            const char *libs[] = { "/usr/lib/libsystem_kernel.dylib",
+                                   "/usr/lib/libSystem.B.dylib",
+                                   "/usr/lib/libdispatch.dylib",
+                                   NULL };
+            for (int i = 0; libs[i] && !rfn; i++) {
+                void *h = dlopen(libs[i], RTLD_LAZY);
+                if (!h) continue;
+                rfn = (WVPRespFn)dlsym(h, "responsibility_get_pid_responsible_for_pid");
+            }
+        }
+    }
+    gRespFnFound = rfn ? 1 : 0;
+    if (!rfn) return;
+    pid_t p = rfn(getpid());
+    if (p <= 0) return;
+    gRespPid = (int)p;
+    WVPGetProcPath((int)p, gRespPath, sizeof(gRespPath) - 1);
+}
+
+static BOOL WVPPathIsFluxDo(const char *path) {
+    if (!path || !path[0]) return NO;
+    char low[256];
+    size_t n = strlen(path);
+    if (n >= sizeof(low)) n = sizeof(low) - 1;
+    for (size_t i = 0; i < n; i++) {
+        char c = path[i];
+        low[i] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+    }
+    low[n] = 0;
+    return strstr(low, "/runner.app/") != NULL;
+}
+
+static BOOL WVPIsProxyEligible(void) {
+    if (!WVPIsWebKitNet()) return NO;
+    if (gEligible >= 0) return gEligible == 1;
+    gRespTries++;
+    WVPResolveResponsible();
+    if (gRespPid <= 0) {
+        // 查不到: 前 20 次继续重试(可能进程刚起), 之后永久放弃, 安全优先
+        if (gRespTries >= 20) gEligible = 0;
+        return NO;
+    }
+    BOOL ok = WVPPathIsFluxDo(gRespPath);
+    gEligible = ok ? 1 : 0;
+    return ok;
+}
+
 #pragma mark - 网络信标 (0.1.5 诊断用)
 
 static void *WVPBeaconClient(void *arg) {
@@ -556,14 +669,15 @@ static void *WVPBeaconClient(void *arg) {
 
     char body[1024];
     int blen = snprintf(body, sizeof(body),
-        "ver=0.1.11 pid=%d app=%d wknet=%d\n"
+        "ver=0.1.12 pid=%d app=%d wknet=%d\n"
         "sysCalls=%d sysHit=%d sysMiss=%d\n"
         "forURLCalls=%d forURLHit=%d autoCfgCalls=%d\n"
         "relayPort=%d relayConns=%d up=%d down=%d\n"
         "activePort=%d domains=%lu global=%d enabled=%d\n"
         "lastHeadLen=%d lastReq=[%s]\n"
         "peerPid=%d peerPrev=%d peerPrev2=%d\n"
-        "nsCfgGet=%d nsCfgDef=%d nsCfgEph=%d connRelay=%d connTotal=%d\n",
+        "nsCfgGet=%d nsCfgDef=%d nsCfgEph=%d connRelay=%d connTotal=%d\n"
+        "respPid=%d eligible=%d respFn=%d tries=%d pathSrc=%d respPath=[%s]\n",
         getpid(), (int)gIsApp, (int)gIsWKNet,
         gProxyCalls, gProxyHit, gProxyMiss,
         gCallsForURL, gHitForURL, gCallsAutoCfg,
@@ -572,7 +686,8 @@ static void *WVPBeaconClient(void *arg) {
         (int)WVPGlobalMode(), (int)WVPEnabled(),
         gLastHostLen, gLastReq,
         gLastPeerPid, gPeerPidPrev, gPeerPidPrev2,
-        gNsCfgGet, gNsCfgDefault, gNsCfgEphemeral, gConnRelay, gConnTotal);
+        gNsCfgGet, gNsCfgDefault, gNsCfgEphemeral, gConnRelay, gConnTotal,
+        gRespPid, gEligible, gRespFnFound, gRespTries, gPathSrc, gRespPath);
 
     char head[256];
     int hlen = snprintf(head, sizeof(head),
@@ -666,7 +781,7 @@ static void WVPStartBeaconWatchdog(int port) {
 // 系统代理设置: iOS 上 CFNetwork 读取系统代理的唯一入口
 // (SCDynamicStoreCopyProxies 在 iOS SDK 里被标记为 unavailable, 不能用)
 %hookf(CFDictionaryRef, CFNetworkCopySystemProxySettings) {
-    if (WVPIsWebKitNet()) {
+    if (WVPIsProxyEligible()) {
         gProxyCalls++;
         NSDictionary *p = WVPProxyDict();
         if (p) { gProxyHit++; return (CFDictionaryRef)CFBridgingRetain(p); }
@@ -678,7 +793,7 @@ static void WVPStartBeaconWatchdog(int port) {
 // WebKit 真正的入口: CFNetwork 在发请求前用这个函数把「URL -> 代理列表」算出来。
 // 只要在这里返回我们的转发器, WKWebView 的所有请求就会走 127.0.0.1:65530。
 %hookf(CFArrayRef, CFNetworkCopyProxiesForURL, CFURLRef url, CFDictionaryRef proxySettings) {
-    if (WVPIsWebKitNet()) {
+    if (WVPIsProxyEligible()) {
         gCallsForURL++;
         NSString *host = nil;
         if (url) {
@@ -694,7 +809,7 @@ static void WVPStartBeaconWatchdog(int port) {
 
 // PAC 脚本路径: 仅计数, 不改行为。
 %hookf(CFArrayRef, CFNetworkCopyProxiesForAutoConfigurationScript, CFStringRef script, CFURLRef targetURL, CFErrorRef *error) {
-    if (WVPIsWebKitNet()) gCallsAutoCfg++;
+    if (WVPIsProxyEligible()) gCallsAutoCfg++;
     return %orig;
 }
 
@@ -737,7 +852,7 @@ static void WVPStartBeaconWatchdog(int port) {
 %hook NSURLSessionConfiguration
 
 - (NSDictionary *)connectionProxyDictionary {
-    if (WVPIsWebKitNet()) {
+    if (WVPIsProxyEligible()) {
         gNsCfgGet++;
         NSDictionary *p = WVPProxyDict();
         if (p) return p;
@@ -747,7 +862,7 @@ static void WVPStartBeaconWatchdog(int port) {
 
 + (NSURLSessionConfiguration *)defaultSessionConfiguration {
     NSURLSessionConfiguration *c = %orig();
-    if (WVPIsWebKitNet()) {
+    if (WVPIsProxyEligible()) {
         gNsCfgDefault++;
         NSDictionary *p = WVPProxyDict();
         if (p) c.connectionProxyDictionary = p;
@@ -757,7 +872,7 @@ static void WVPStartBeaconWatchdog(int port) {
 
 + (NSURLSessionConfiguration *)ephemeralSessionConfiguration {
     NSURLSessionConfiguration *c = %orig();
-    if (WVPIsWebKitNet()) {
+    if (WVPIsProxyEligible()) {
         gNsCfgEphemeral++;
         NSDictionary *p = WVPProxyDict();
         if (p) c.connectionProxyDictionary = p;
@@ -783,7 +898,7 @@ static void WVPStartBeaconWatchdog(int port) {
     BOOL isNet = WVPIsWebKitNet();
     gIsApp = isApp;
 
-    WVPLog(@"=== 0.1.11 loaded into %@ (pid %d, app=%d, wknet=%d) ===",
+    WVPLog(@"=== 0.1.12 loaded into %@ (pid %d, app=%d, wknet=%d) ===",
            bid ?: @"?", getpid(), isApp, isNet);
 
     // 信标先起, 哪怕后面全部失败也能被 SSH 看到
