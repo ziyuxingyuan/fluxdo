@@ -584,7 +584,7 @@ static char          gEnvDump[320] = {0};
 typedef pid_t (*WVPRespFn)(pid_t);
 typedef int   (*WVPProcPathFn)(int, char *, unsigned int);
 
-static void WVPGetProcPath(int pid, char *out, size_t outlen) {
+static __attribute__((unused)) void WVPGetProcPath(int pid, char *out, size_t outlen) {
     if (!out || outlen < 2) return;
     out[0] = 0;
     static WVPProcPathFn pf = NULL;
@@ -619,7 +619,7 @@ static void WVPGetProcPath(int pid, char *out, size_t outlen) {
     free(buf);
 }
 
-static void WVPResolveResponsible(void) {
+static __attribute__((unused)) void WVPResolveResponsible(void) {
     if (gRespPid > 0) return;
     static WVPRespFn rfn = NULL;
     static BOOL looked = NO;
@@ -647,7 +647,7 @@ static void WVPResolveResponsible(void) {
 }
 
 // 0.1.14 诊断: 找一个能区分「这个 wknet 在替哪个 App 干活」的判据
-static void WVPProbeIdentity(void) {
+static __attribute__((unused)) void WVPProbeIdentity(void) {
     // a) sandbox_container_path_for_pid: 每个 App 沙盒容器路径带上 App 的 UUID
     typedef int (*WVPSandboxContFn)(pid_t, char *, size_t);
     static WVPSandboxContFn sfn = NULL;
@@ -703,7 +703,7 @@ static void WVPProbeIdentity(void) {
     free(buf);
 }
 
-static BOOL WVPPathIsFluxDo(const char *path) {
+static __attribute__((unused)) BOOL WVPPathIsFluxDo(const char *path) {
     if (!path || !path[0]) return NO;
     char low[256];
     size_t n = strlen(path);
