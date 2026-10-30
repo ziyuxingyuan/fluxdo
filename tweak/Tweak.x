@@ -1,6 +1,13 @@
-// WebViewProxy 0.1.14 - 让 FluxDo 的 WKWebView 走它自己的本地 DoH 代理
+// WebViewProxy 0.1.15 - 让 FluxDo 的 WKWebView 走它自己的本地 DoH 代理
 //
-// 0.1.14 (归属判定换实现): responsibility 私有符号在本机 dlsym 不到,
+// 0.1.15: 去掉 0.1.14 的危险兜底。
+//   0.1.14 在「读不到心跳文件」时仍然接管(最多 200 次), 等于给
+//   Safari 等其它 App 的 wknet 留了一道 200 次的后门。实测已证明
+//   心跳文件方案在 wknet 里可用(ownerSeen=1 ownerAge=0 eligSrc=1),
+//   因此改成: 读不到 / 过期 一律放行, 且不锁定, 每次调用重新检查
+//   (一次 stat 而已), 这样 App 晚一点写文件也能自动接上。
+//
+// 0.1.15 (归属判定换实现): responsibility 私有符号在本机 dlsym 不到,
 //   但 0.1.13 的诊断给出了更好的判据 —— WebKit 网络进程的 HOME
 //   就是它服务的那个 App 的数据容器。所以改用「容器内的心跳文件」:
 //     App 进程每 2 秒写 $HOME/tmp/wvp_owner (含 pid/port/时间戳)
@@ -8,7 +15,7 @@
 //   Safari 等其它 App 的 wknet 容器里没有这个文件, 天然放行;
 //   FluxDo 退出后心跳停止, 10 秒内自动失效, 不再出现「黑端口拖死全机」。
 //
-// 0.1.14 (关键修复): 加进程归属判定
+// 0.1.15 (关键修复): 加进程归属判定
 //   com.apple.WebKit.Networking 是所有 App 共用的系统网络进程族。
 //   0.1.11 只按进程名判断, 于是给设备上每一个 WebView 都塞了
 //   HTTPProxy=127.0.0.1:65530。FluxDo 一旦被 iOS 挂起, 65530 变成
@@ -564,7 +571,7 @@ static BOOL WVPIsWebKitNet(void) {
     return gIsWKNet;
 }
 
-#pragma mark - 进程归属判定 (0.1.14)
+#pragma mark - 进程归属判定 (0.1.15)
 
 // 用 responsibility 私有 API 问内核 "我是替哪个进程干活"。
 // com.apple.WebKit.Networking 是系统共享的, 光看进程名无法区分 Safari 与 FluxDo。
@@ -574,7 +581,7 @@ static volatile int  gRespFnFound = 0;    // responsibility 符号是否存在
 static volatile int  gPathSrc     = 0;    // 路径来源: 1=proc_pidpath 2=sysctl 0=失败
 static volatile int  gRespTries   = 0;    // 查了几次
 static char          gRespPath[256] = {0};
-// 0.1.14 诊断: responsibility 符号在本机 dlsym 不到, 需要找替代判据
+// 0.1.15 诊断: responsibility 符号在本机 dlsym 不到, 需要找替代判据
 static volatile int  gSandboxFn  = 0;    // sandbox_container_path_for_pid 是否存在
 static volatile int  gSandboxRc  = -1;   // 它的返回值
 static char          gSandboxPath[256] = {0};
@@ -646,7 +653,7 @@ static __attribute__((unused)) void WVPResolveResponsible(void) {
     WVPGetProcPath((int)p, gRespPath, sizeof(gRespPath) - 1);
 }
 
-// 0.1.14 诊断: 找一个能区分「这个 wknet 在替哪个 App 干活」的判据
+// 0.1.15 诊断: 找一个能区分「这个 wknet 在替哪个 App 干活」的判据
 static __attribute__((unused)) void WVPProbeIdentity(void) {
     // a) sandbox_container_path_for_pid: 每个 App 沙盒容器路径带上 App 的 UUID
     typedef int (*WVPSandboxContFn)(pid_t, char *, size_t);
@@ -716,7 +723,7 @@ static __attribute__((unused)) BOOL WVPPathIsFluxDo(const char *path) {
     return strstr(low, "/runner.app/") != NULL;
 }
 
-// ===== 0.1.14 容器心跳文件 =====
+// ===== 0.1.15 容器心跳文件 =====
 // wknet 的 HOME == 它服务的 App 数据容器, 两者看到同一个 $HOME/tmp/。
 static volatile int  gOwnerWrites = 0;   // App 侧写了几次
 static volatile int  gOwnerSeen   = 0;   // wknet 侧能否看到文件
@@ -780,24 +787,17 @@ static BOOL WVPOwnerFresh(void) {
 
 static BOOL WVPIsProxyEligible(void) {
     if (!WVPIsWebKitNet()) return NO;
-    if (gEligible >= 0) return gEligible == 1;
-    // 心跳文件新鲜 -> 这是 FluxDo 的 wknet
+    // 已经确认过是 FluxDo 的 wknet 就一直认(该进程随 FluxDo 存亡)
+    if (gEligible == 1) return YES;
+    // 心跳新鲜 -> 我的宿主是 FluxDo, 接管。
+    // 读不到 / 过期 -> 放行, 但**不锁定**, 每次重新检查,
+    // 这样 FluxDo 稍后才写文件也能立刻生效, 而其它 App 永远不会被接管。
     if (WVPOwnerFresh()) {
         gEligibleSrc = 1;
         gEligible = 1;
         return YES;
     }
-    if (gOwnerSeen == 1) {
-        // 文件在但过期: FluxDo 已退出, 放行, 但允许以后重新变新鲜
-        gEligibleSrc = 3;
-        // 首次判定就过期(比如刚重启)时给 3 秒宽限, 避免竞态
-        if (gRespTries < 3) { gRespTries++; return YES; }
-        return NO;
-    }
-    // 读不到文件: 可能是沙盒限制。兜底按老行为接管, 保证功能不丢
-    gEligibleSrc = 2;
-    gRespTries++;
-    if (gRespTries < 200) return YES;
+    gEligibleSrc = (gOwnerSeen == 1) ? 3 : 2;
     return NO;
 }
 
@@ -812,7 +812,7 @@ static void *WVPBeaconClient(void *arg) {
 
     char body[1024];
     int blen = snprintf(body, sizeof(body),
-        "ver=0.1.14 pid=%d app=%d wknet=%d\n"
+        "ver=0.1.15 pid=%d app=%d wknet=%d\n"
         "sysCalls=%d sysHit=%d sysMiss=%d\n"
         "forURLCalls=%d forURLHit=%d autoCfgCalls=%d\n"
         "relayPort=%d relayConns=%d up=%d down=%d\n"
@@ -1047,7 +1047,7 @@ static void WVPStartBeaconWatchdog(int port) {
     BOOL isNet = WVPIsWebKitNet();
     gIsApp = isApp;
 
-    WVPLog(@"=== 0.1.14 loaded into %@ (pid %d, app=%d, wknet=%d) ===",
+    WVPLog(@"=== 0.1.15 loaded into %@ (pid %d, app=%d, wknet=%d) ===",
            bid ?: @"?", getpid(), isApp, isNet);
 
     // 信标先起, 哪怕后面全部失败也能被 SSH 看到
